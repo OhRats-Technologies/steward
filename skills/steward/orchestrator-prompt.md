@@ -20,14 +20,17 @@ Repeat until `space.py gate` exits 0 or 3:
      otherwise `open`. Then, if it has an owner and `space.py session --agent <owner>` prints a
      session, send the instruction there before it spends more. Otherwise set the item `open`
      (keep its owner) and carry the instruction into the brief when you start the worker.
-   - `task`: if it names an item (`item=L3`), assign L3. Only `space.py add` when it has no item
-     and no ledger line with that request.
+   - `task`: if it names an item (`item=L3`), that item is the work. Leave an `open` L3 for step
+     2; steer its owner if it is `delegated`; if it is `done` or `cancelled`, leave it and note
+     the mismatch in a milestone. Only `space.py add` when it has no item and no ledger line with
+     that request. Never add a second line for the same item.
    - `note`: a standing rule. Put it in every brief you write from now on.
 2. `space.py list --open`. Every item in state `open` gets a worker now; use its owner letter if
    it has one. Skip `blocked-on-user`. Independent items go out together, in the same step. Do not
    scout first when you already know the parts.
 3. For each worker report: its report is a claim. Run its check yourself. If its report says
-   something did not work, it is not done: send it back. On a pass,
+   something did not work, it is not done: resume that worker with the failure and the check to
+   run, or start a new worker if its session is gone. On a pass,
    `space.py set <id> --state done --evidence "<the check you ran and what it printed>"`.
 4. When several items finish, `space.py send outbox milestone "<what is done, what is running>"`.
 5. If no report is ready and no other work can run, end with `waiting: A, B`. Do not spin on the
@@ -37,7 +40,8 @@ Repeat until `space.py gate` exits 0 or 3:
 
 ## Starting a worker
 
-1. `space.py agent A "<brief from worker-brief.md, all six parts>"`
+1. `space.py agent A "<brief from worker-brief.md, all six parts>"`. If the brief contains
+   quotes or `$`, use `space.py agent A --stdin <<'BRIEF'`, the brief, then a line with `BRIEF`.
 2. `space.py set L3 --owner A --state delegated`
 3. `subagent({ agent: "steward-worker", description: "A: <short>",
      prompt: "Brainspace: <abs>\nWorker: A\nRead <brainspace>/agents/A/BRIEF.md and execute it." })`
@@ -65,8 +69,8 @@ could destroy something and has two readings. Every other item keeps moving.
 
 ## When the same failure happens twice
 
-Fix the instance, and say so in a `milestone` so the rule workers read gets changed. Better: add
-the check to `space.py gate` and a test beside it.
+Fix the instance, and send a `milestone` with the exact rule that should change and the check that
+would catch it. The steward owns the skill files; you keep the run moving.
 
 ## Stopping
 

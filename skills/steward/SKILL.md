@@ -112,15 +112,16 @@ turn. Without it, a directive sits unread in a finished or waiting session.
   keeps moving. When the answer arrives, send it as a steer and wake the orchestrator.
 - `finished`: run `space.py gate`. Exit 0 plus the goal's own done command is the only reason to
   tell the user it is done. Exit 3 means a user decision is still pending; handle it. Exit 2 means
-  work remains. Ack the finished line after you act.
+  work remains. If the gate is 0 but the done command fails, add a task for the gap, wake the
+  orchestrator, and do not report done. Ack the finished line after you act.
 - `milestone`: read it, ack it, end.
 - A report that says only `waiting: A, B` is a check-in. Read the ledger and up to three
   `STATUS.md` files; correct drift with a steer or a note; end.
 - A report that says `waiting on user` with no outbox line: read the ledger for the
   `blocked-on-user` item and treat its request as the escalation.
 
-An idle orchestrator with open ownerless work is a bug: resume it with `Continue.` Never launch a
-second orchestrator; the brainspace is shared state, but two sessions would duplicate the work.
+An idle orchestrator with open work is a bug: resume it with `Continue.` Never launch a second
+orchestrator; the brainspace is shared state, but two sessions would duplicate the work.
 
 ## A check-in
 

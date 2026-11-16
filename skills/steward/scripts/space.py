@@ -13,6 +13,7 @@ brainspace from different processes.
   space.py --dir DIR read inbox|outbox                           # print unread, does not consume
   space.py --dir DIR ack inbox|outbox ID [ID...]                 # consume after handling
   space.py --dir DIR agent B "brief text"                        # creates agents/B/ with BRIEF.md
+  space.py --dir DIR agent B --stdin                             # read the brief from stdin
   space.py --dir DIR session [SESSION_ID] [--agent A]            # store/print a subagent session id
   space.py --dir DIR gate                                        # 0 finished, 2 continue, 3 waiting on user
 """
@@ -165,7 +166,8 @@ def main() -> int:
     p.add_argument("ids", nargs="+")
     p = sub.add_parser("agent")
     p.add_argument("letter")
-    p.add_argument("brief")
+    p.add_argument("brief", nargs="?", default=None)
+    p.add_argument("--stdin", action="store_true")
     p = sub.add_parser("session")
     p.add_argument("id", nargs="?", default=None)
     p.add_argument("--agent", default=None)
@@ -253,13 +255,17 @@ def main() -> int:
             if not LETTER.fullmatch(args.letter):
                 print("agent letter must be a single word, e.g. A", file=sys.stderr)
                 return 1
-            if not args.brief.strip():
+            if args.stdin and args.brief is not None:
+                print("agent takes a brief or --stdin, not both", file=sys.stderr)
+                return 1
+            brief = sys.stdin.read() if args.stdin else (args.brief or "")
+            if not brief.strip():
                 print("agent needs a brief", file=sys.stderr)
                 return 1
             home = root / "agents" / args.letter
             (home / "notes").mkdir(parents=True, exist_ok=True)
             (home / "out").mkdir(exist_ok=True)
-            (home / "BRIEF.md").write_text(args.brief.strip() + "\n")
+            (home / "BRIEF.md").write_text(brief.strip() + "\n")
             (home / "STATUS.md").touch()
             print(home)
         elif args.cmd == "session":

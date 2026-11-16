@@ -236,6 +236,20 @@ class SpaceTest(unittest.TestCase):
         self.assertTrue((home / "notes").is_dir())
         self.assertTrue((home / "out").is_dir())
 
+    def test_agent_reads_a_brief_from_stdin(self) -> None:
+        self.init()
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "--dir", str(self.dir), "agent", "B", "--stdin"],
+            input='do the thing\nwith a "quote" and $HOME\n',
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(
+            (self.dir / "agents" / "B" / "BRIEF.md").read_text().strip(),
+            'do the thing\nwith a "quote" and $HOME',
+        )
+
     def test_agent_rejects_a_path_letter(self) -> None:
         self.init()
         proc = self.space("agent", "../A", "brief", ok=False)
@@ -243,11 +257,23 @@ class SpaceTest(unittest.TestCase):
         self.assertIn("single word", proc.stderr)
         self.assertFalse((self.dir.parent / "A").exists())
 
+    def test_agent_requires_a_brief(self) -> None:
+        self.init()
+        proc = self.space("agent", "A", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("needs a brief", proc.stderr)
+
     def test_agent_rejects_an_empty_brief(self) -> None:
         self.init()
         proc = self.space("agent", "A", "   ", ok=False)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("needs a brief", proc.stderr)
+
+    def test_agent_rejects_brief_and_stdin_together(self) -> None:
+        self.init()
+        proc = self.space("agent", "A", "brief", "--stdin", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not both", proc.stderr)
 
     def test_session_round_trip(self) -> None:
         self.init()
