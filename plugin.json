@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "steward",
+  "version": "0.1.0",
+  "description": "Three-tier agent orchestration: a frontier steward guards the user channel while a mid-tier orchestrator and cheap workers finish a long goal.",
+  "author": {
+    "name": "OhRats Technologies"
+  },
+  "repository": "https://github.com/OhRats-Technologies/steward",
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "orchestration",
+    "subagents",
+    "opencode",
+    "agent-skills"
+  ]
+}
