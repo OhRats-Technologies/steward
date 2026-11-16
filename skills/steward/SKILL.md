@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Python 3.10+ and OpenCode 2.x with subagents; the included agent adapter is OpenCode-specific.
 metadata:
   author: OhRats Technologies
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Steward
@@ -34,15 +34,22 @@ One directory, the brainspace. Keep it inside the project at `.steward/`; never 
     agents/<X>/     one worker: BRIEF.md, STATUS.md, SESSION, notes/, out/
 
 All commands run as `python3 <this skill>/scripts/space.py --dir .steward ...`; `--help` lists them.
-`read` prints unread lines and does not consume them. Act, then `ack` the ids. The gate stays
-blocked on unacked inbox lines. The orchestrator reads and acks `INBOX.jsonl`; you read and ack
-`OUTBOX.jsonl`. Never ack the other tier's mailbox.
+The script is the state machine. It refuses an illegal step and says what to do instead, so read
+its error and follow it; do not edit the JSON files by hand.
 
-State is JSON lines and plain files on purpose. You read the ledger and status files directly;
-SQLite would hide them behind queries and add a dependency. The writers are few (you and one
-orchestrator), so `space.py` takes a file lock and replaces files atomically. The brainspace is
-durable and project-scoped; `init` writes a `.gitignore` inside it. The lock is POSIX; on Windows,
-run under WSL.
+    open -> delegated -> done            done needs evidence, or the item's own check passing;
+                                         only `assign` delegates, and only open work
+    open | delegated -> blocked-on-user  (escalate)  -> back to work on your steer
+    open | delegated | blocked -> cancelled
+    done -> open | delegated             (a steer reopens it and clears the old evidence)
+
+`read` prints unacked lines and does not consume them. Act, then `ack <id>` (`ack O1`). The gate stays
+closed on unacked inbox lines. The orchestrator acks `INBOX.jsonl`; you ack `OUTBOX.jsonl`. Never
+ack the other tier's mailbox.
+
+State is JSON lines and plain files on purpose: you can read them, they survive a reboot, and the
+two writers are serialized by a file lock (POSIX; on Windows, run under WSL). `init` writes a
+`.gitignore` inside the brainspace.
 
 ## Install (once per project)
 
@@ -68,7 +75,9 @@ launching workers. The launching session needs the `subagent` tool and permissio
 2. Write `.steward/GOAL.md`: the goal in the user's words, a command or observation that shows it
    is done, what must not be touched, and what needs the user's permission. Ask the user only for
    what is missing and cannot be guessed.
-3. One `space.py add` per top-level request. `add` prints the id; keep it.
+3. One `space.py task "<request>" --check "<command>"` per top-level request. The check is a shell
+   command, run from the project root, that exits 0 only when the request is met. With a check,
+   nobody can mark the item done by saying so. Leave `--check` out only when no command can tell.
 4. Launch the orchestrator once:
 
        subagent({ agent: "steward-orchestrator", description: "Run goal",
@@ -86,18 +95,20 @@ each idle produces a report in this session. That report is your wake.
 
 | Act | You do |
 |---|---|
-| Task | `space.py add "..."`, then `send inbox task "..." --item <id>` |
-| Change to running work | `send inbox steer "<the new instruction>" --item <id>`; if the item is `done`, `set <id> --state open` first |
-| Answer to an escalation | `send inbox steer "<the answer>" --item <id>`; `set <id> --state delegated` if it has an owner (otherwise `--state open`) |
-| Cancellation | `send inbox cancel "..." --item <id>`; `set <id> --state cancelled` |
-| Question | answer it yourself from `LEDGER.jsonl` and `agents/*/STATUS.md`. If the answer is not there, say so and route a lookup task as above |
-| Status check | read the ledger and status files; reply; send nothing |
-| Standing preference | write it into `GOAL.md` and `send inbox note "..."` |
+| Task | `task "<request>" [--check "<command>"]` |
+| Change to running or finished work | `steer <id> "<the new instruction>"` |
+| Answer to an escalation | `steer <id> "<the answer>"` |
+| Cancellation | `cancel <id> "<why>"` |
+| Standing preference | `note "<the rule>"` (it lands in `GOAL.md` and in every later brief). Only for a rule that binds all work; an instruction or answer about one item is a `steer`, never also a `note` |
+| Question or status check | `status`, then answer from what it prints. Send nothing. If the answer is not there, say so and route a lookup `task` |
+
+Each verb changes the ledger and writes the directive in one step. `steer` puts a blocked or
+finished item back to work by itself; you never set states by hand.
 
 A constraint stated beside a task is its own act. Reply to the user in the same turn: what you
 routed, what is running, what comes next.
 
-After sending a `task`, `steer`, `cancel` or `note`, wake the orchestrator with its session handle
+After a `task`, `steer`, `cancel` or `note`, wake the orchestrator with its session handle
 (`space.py session` prints it):
 `subagent({ agent: "steward-orchestrator", description: "Continue", sessionID: "<SESSION>",
 prompt: "Continue." })`. A follow-up to a running child joins its run; to an idle one it starts a
@@ -105,39 +116,39 @@ turn. Without it, a directive sits unread in a finished or waiting session.
 
 **A report from the orchestrator.** Read the outbox, handle it, ack it.
 
-- `escalate`: decide from `GOAL.md` if you can. Then append the decision to `GOAL.md`,
-  `set <id> --state delegated` if it has an owner (otherwise `--state open`),
-  `send inbox steer "<decision>" --item <id>`, and wake the orchestrator with the session handle.
-  Ack the outbox line after the wake. The orchestrator keeps working on other items while one is
-  blocked; if it is still running, the follow-up joins its run. If the answer is the user's, ask
-  one specific question, leave the item blocked, and do not wake it for that item; other work
-  keeps moving. When the answer arrives, send it as a steer, restore the item's state, and wake
-  the orchestrator.
+- `escalate`: if `GOAL.md` already answers the question, do not ask the user: `steer <id>
+  "<decision>"` (it records the decision in `GOAL.md`), wake the orchestrator, `ack O<n>`. If the answer is the
+  user's, ask one specific question, leave the item blocked, and do not wake the orchestrator for
+  that item; other work keeps moving. When the answer arrives, `steer` and wake.
 - `finished`: run `space.py gate`. Exit 0 plus the goal's own done command is the only reason to
   tell the user it is done. Exit 3 means a user decision is still pending; handle it. Exit 2 means
   work remains. If the gate is 0 but the done command fails, add a task for the gap, wake the
   orchestrator, and do not report done. Ack the finished line after you act.
 - `milestone`: read it; if it names a rule that should change, edit the skill file; ack it; end.
-- A report that says only `waiting: A, B` is a check-in. Read the ledger and up to three
-  `STATUS.md` files; correct drift with a steer or a note; end.
-- A report that says `waiting on user` with no outbox line: read the ledger for the
-  `blocked-on-user` item and treat its request as the escalation.
+- A report that says only `waiting: A, B` is a check-in (below).
+- A report that says `waiting on user` with no outbox line: `status` shows the `blocked-on-user`
+  item; treat its request as the escalation.
 
 An idle orchestrator with open work is a bug: resume it with `Continue.` Never launch a second
-orchestrator; the brainspace is shared state, but two sessions would duplicate the work.
+orchestrator: `session` refuses to record one while another is on file. Pass `--replace` only
+when the old session is gone.
 
 ## A check-in
 
-Read the ledger and two or three status files, nothing else. Look for: an item marked done without
-evidence, an agent silent past its expected time, work drifting from `GOAL.md`, the same failure
-twice. Correct by sending a `steer` or a `note`. A failure seen twice becomes a line in
-`orchestrator-prompt.md` or `worker-brief.md`, or better a check in `space.py gate`.
+Run `status`. It prints the phase, every item with its evidence, each worker's last status line,
+and `STALE` beside a worker that has been silent too long. Look for: evidence that does not show a
+command and its output, a stale worker, work drifting from `GOAL.md`, the same failure twice.
+Correct with a `steer` or a `note`.
+
+A failure seen twice is an implicit state machine: some sequence the prompts describe but nothing
+enforces. Name its states, then make the bad step impossible in `space.py` (a refused transition,
+a gate line) before you add a sentence to a prompt.
 
 ## Budget
 
-Per wake: read the ledger, the gate, the outbox and at most three status files. Do not read code,
-logs or worker output. If you need more than that to decide, send a lookup task. Your cost should
-be a few thousand tokens per wake.
+Per wake: `status`, `gate`, `read outbox` and at most three status files. Do not read code, logs
+or worker output. If you need more than that to decide, send a lookup task. Your cost should be a
+few thousand tokens per wake.
 
 ## Rules
 
@@ -149,3 +160,4 @@ be a few thousand tokens per wake.
 - One orchestrator, one item, one owner, one brief. Resume the session; do not duplicate it.
 - `read` then `ack`. An unacked directive keeps the gate closed; an acked one is your
   responsibility.
+- When `space.py` refuses a command, do what its message says. Do not work around it.

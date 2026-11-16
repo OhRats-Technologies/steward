@@ -1,6 +1,8 @@
-# Worker brief template
+# Worker brief
 
-Fill all six parts. The worker reads this brief, its agent prompt and its directory.
+`space.py assign` writes this brief: you supply parts 1 to 3 (`--goal`, `--done`, `--known`) and
+it fills parts 4 to 6 and the standing rules. The worker reads the brief, its agent prompt and its
+directory.
 
 1. **Goal.** One task, and what it is for.
 2. **Done.** A command whose output shows it is done, or the exact file that must exist.

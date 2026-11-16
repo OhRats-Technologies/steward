@@ -17,3 +17,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run state tests
         run: python -m unittest discover -s skills/steward/tests -v
+      - name: Check eval scenarios
+        run: python evals/run.py --selfcheck

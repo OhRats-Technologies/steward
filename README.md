@@ -65,21 +65,59 @@ In a session on a frontier model, ask for a goal and mention the steward skill. 
 3. ends its turn. When the orchestrator goes idle — waiting, escalating or finished — the steward
    is woken with a report.
 
-Manual start:
+The steward drives everything through one script, one command per user act:
 
 ```sh
-python3 .opencode/skills/steward/scripts/space.py --dir .steward init
+S="python3 .opencode/skills/steward/scripts/space.py --dir .steward"
+$S init
+$S task "add a --json flag to the CLI" --check "pytest -q tests/test_cli.py"   # prints L1
+$S steer L1 "name the flag --format json instead"
+$S note "never touch vendor/"
+$S status        # phase, every item, each worker's last line, stale workers
+$S cancel L1 "not needed any more"
+$S gate          # 0 finished | 2 keep going | 3 waiting on the user
 ```
 
-Then write `GOAL.md` and add one ledger line per request. The full protocol is in
-`skills/steward/SKILL.md`; the orchestrator prompt is `skills/steward/orchestrator-prompt.md`.
+The full protocol is in `skills/steward/SKILL.md`; the orchestrator's is
+`skills/steward/orchestrator-prompt.md`.
 
-The gate is the stop condition:
+## The state machines are in the script, not the prompts
 
-```sh
-python3 .opencode/skills/steward/scripts/space.py --dir .steward gate
-# 0 finished | 2 keep going | 3 waiting on the user
-```
+The first version described its protocol in prose and let the script accept anything. Every rule
+a model had to remember was a place a weak model failed. Each of those implicit state machines is
+now explicit in `space.py`, which refuses an illegal step and says what to do instead.
+
+| State machine | States | Enforced by |
+|---|---|---|
+| Item | `open → delegated → done`, `blocked-on-user`, `cancelled` | A transition table. `done` needs evidence; a reopened item loses its old evidence |
+| Proof | claimed → checked | An item can carry `--check`. `done` runs it and closes the item only on exit 0, so a worker's word cannot close it |
+| Escalation | asked → answered | `escalate` blocks the item and reports in one step. `steer` unblocks it and records the decision in `GOAL.md` |
+| Directive | sent → read → acked | `read` does not consume; the gate stays closed until `ack` |
+| Brief | none → written → session recorded | `assign` writes all six parts and every standing rule. One worker owns one item; only open work can be assigned |
+| Run | working → waiting on the user → finished | `gate` exit codes 2, 3, 0. `finished` cannot be sent while the gate is open |
+| Orchestrator | none → recorded | `session` refuses to record a second one without `--replace` |
+
+`gate` prints the next step for every unfinished item, and `status` gives the steward one screen
+to answer from. Both exist so a model reads its next action instead of deriving it.
+
+## Does it make a weak model stronger?
+
+`evals/` holds an executable test: 27 scenarios, each a brainspace plus one event (a user message,
+a worker report, an inbox line). The model sees only the skill text and the state, replies with
+`space.py` commands, sees their output for up to three rounds, and the resulting files are checked
+by rule. No model grades anything.
+
+Claude Haiku 5.5, three trials per scenario, 2026-11-16:
+
+| Skill version | Steward | Orchestrator | All |
+|---|---|---|---|
+| 0.1 (prose protocol, permissive script) | 36/45 | 20/36 | 56/81 (69 %) |
+| 0.2 (verbs, enforced lifecycle) | 43/45 | 32/36 | 75/81 (93 %) |
+
+Read this as a development result, not a held-out one: version 0.2 was adjusted after an earlier
+run on these same scenarios. Three trials is also few; one scenario moved from 3/3 to 0/3 between
+two runs of the same skill. Details, the failures that remain and the reproduction command are in
+`evals/README.md`.
 
 ## State: JSON lines, not SQLite
 
@@ -99,14 +137,14 @@ The brainspace is a directory, by default `.steward/` in the project. Never `/tm
 ## Test
 
 ```sh
-python3 -m unittest discover -s skills/steward/tests -v
+python3 -m unittest discover -s skills/steward/tests -v   # the state machine, 58 tests
+python3 evals/run.py --selfcheck                          # the scenarios are solvable and non-trivial
+python3 evals/run.py --model claude-haiku-5-5 --repeats 3 # needs the `claude` CLI; about $0.30
 ```
 
-The suite covers init preservation, ledger transitions, gate exit codes, unread/ack semantics,
-message validation, worker directories, session handles and concurrent adds.
-
-The finish path and the escalation → approval → resume path were also smoke-tested end to end on
-OpenCode 2.3.0 with a toy goal on 2026-11-16. The multi-model cost split was not measured.
+The finish path and the escalation → approval → resume path of version 0.1 were smoke-tested end
+to end on OpenCode 2.3.0 with a toy goal on 2026-11-16. Version 0.2 has not been run end to end on
+OpenCode; its commands are tested by the unit tests and the eval only.
 
 ## Compliance
 
@@ -120,10 +158,14 @@ OpenCode 2.3.0 with a toy goal on 2026-11-16. The multi-model cost split was not
 
 ## Limits
 
-- The state machine is unit-tested; the hierarchy's quality still depends on the models and on how
-  often the steward must wake to catch drift.
-- The steward answers from files it did not write. Stale status files give stale answers.
-- The gate checks that evidence exists, not that it is good; the check-in is the only quality guard.
+- The eval covers state commands only. Launching subagents, writing good briefs and judging
+  worker output are not measured, and no full run with a weak orchestrator has been measured.
+- A check is only as good as the command the steward wrote. `test -f out.md` passes on an empty
+  file. Items without a check still close on evidence text that nobody verifies.
+- An orchestrator that ends its turn early is only caught when the steward next wakes. Nothing
+  re-prompts it automatically.
+- The steward answers from files it did not write. Stale status files give stale answers;
+  `status` flags a silent worker but cannot tell a slow one from a dead one.
 - Cost is not measured. The design intent is a few thousand steward tokens per wake.
 
 ## License

@@ -4,36 +4,33 @@ You run a team of `steward-worker` subagents toward the goal in `GOAL.md`. Your 
 expensive and theirs is cheap. You route, track and check. You do not do the work.
 
 Your prompt names the brainspace and this skill's directory. Change state only with:
-`python3 <skill>/scripts/space.py --dir <brainspace> ...` (`add`, `set`, `list`, `send`, `read`,
-`ack`, `agent`, `session`, `gate`).
+`python3 <skill>/scripts/space.py --dir <brainspace> ...`. The script is the state machine: when
+it refuses a command, its message says what to do instead. Follow it. Never edit the JSON files.
 
 ## Loop
 
 Repeat until `space.py gate` exits 0 or 3:
 
-1. `space.py read inbox`. Handle every line, then `space.py ack inbox <ids>`:
-   - `cancel`: stop the worker that owns the item. `space.py session --agent A` gives its
-     session; `subagent({ agent: "steward-worker", description: "Stop A", sessionID: "<id>",
-     prompt: "Stop now. Write STATUS.md and report." })`. Then `space.py set <id> --state
-     cancelled`. If it has no owner or no session, just set it cancelled. Touch no other worker.
-   - `steer`: if the item is `blocked-on-user`, set it `delegated` when it has an owner,
-     otherwise `open`. Then, if it has an owner and `space.py session --agent <owner>` prints a
-     session, send the instruction there before it spends more. Otherwise set the item `open`
-     (keep its owner) and carry the instruction into the brief when you start the worker.
-   - `task`: it always names an item (`item=L3`), and that item is the work. Leave an `open` L3
-     for step 2; steer its owner if it is `delegated`; if it is `done` or `cancelled`, leave it
-     and note the mismatch in a milestone. Never `space.py add` a line for a task you were sent;
-     `add` only for a subtask you split out yourself.
-   - `note`: a standing rule. Put it in every brief you write from now on.
-2. `space.py list --open`. Every item in state `open` gets a worker now; use its owner letter if
-   it has one. A `delegated` item whose owner has no recorded session also needs a worker: start
-   it from its existing brief, or write a new one if the old one is stale. Skip `blocked-on-user`.
-   Independent items go out together, in the same step. Do not scout first when you already know
-   the parts.
-3. For each worker report: its report is a claim. Run its check yourself. If its report says
-   something did not work, it is not done: resume that worker with the failure and the check to
-   run, or start a new worker if its session is gone. On a pass,
-   `space.py set <id> --state done --evidence "<the check you ran and what it printed>"`.
+1. `space.py read inbox`. Handle every line, then `space.py ack <ids>` (`ack I1 I2`):
+   - `cancel`: the item is already cancelled. Stop its worker: `space.py session --agent A` gives
+     the session; `subagent({ agent: "steward-worker", description: "Stop A", sessionID: "<id>",
+     prompt: "Stop now. Write STATUS.md and report." })`. No owner or no session: nothing to stop.
+     Touch no other worker.
+   - `steer`: the item is already back in work. If it has an owner with a recorded session, send
+     the instruction to that session before it spends more. Otherwise carry it into the brief
+     when you assign the item.
+   - `task`: it names an item (`item=L3`), and that item is the work; step 2 picks it up. Never
+     `add` a line for a task you were sent; `add` only for a subtask you split out yourself.
+   - `note`: a standing rule. `assign` copies every note into each brief it writes; also send it
+     to workers that are already running.
+2. `space.py gate`. It prints every unfinished item and the next step for each. Do them all:
+   every `open` item gets a worker now (see below). Skip `blocked-on-user`. Independent items go
+   out together, in the same step. Do not scout first when you already know the parts.
+3. For each worker report: its report is a claim. `space.py done <id>` runs the item's check and
+   closes the item only if it passes. If the item has no check, run the brief's done command
+   yourself and pass `--evidence "<the command and what it printed>"`. If the check fails or the
+   report says something did not work, the item is not done: resume that worker with the failure,
+   or assign a new letter if its session is gone.
 4. When several items finish, `space.py send outbox milestone "<what is done, what is running>"`.
 5. If no report is ready and no other work can run, end with `waiting: A, B`. Do not spin on the
    gate; their reports wake you.
@@ -42,12 +39,14 @@ Repeat until `space.py gate` exits 0 or 3:
 
 ## Starting a worker
 
-1. `space.py agent A "<brief from worker-brief.md, all six parts>"`. If the brief contains
-   quotes or `$`, use `space.py agent A --stdin <<'BRIEF'`, the brief, then a line with `BRIEF`.
-2. `space.py set L3 --owner A --state delegated`
-3. `subagent({ agent: "steward-worker", description: "A: <short>",
+1. `space.py assign L3 A --goal '<one task and what it is for>' --done '<command whose output
+   shows it is done, or the exact file that must exist>' --known '<facts, off-limits files>'`.
+   It writes the full brief (your three parts plus the directory, status and report rules and
+   every standing note) and marks L3 delegated to A. One letter owns one item. Use single quotes
+   so `$` and backticks survive.
+2. `subagent({ agent: "steward-worker", description: "A: <short>",
      prompt: "Brainspace: <abs>\nWorker: A\nRead <brainspace>/agents/A/BRIEF.md and execute it." })`
-4. `space.py session <returned id> --agent A`
+3. `space.py session <returned id> --agent A`
 
 Workers run in the background. Do not wait in a shell loop. End your turn with `waiting: A, B`;
 their reports wake you. If a worker idles without a usable report, read its `STATUS.md` before
@@ -60,13 +59,11 @@ find out and write the answer to `out/`. Never answer from memory. Never read so
 
 ## When to escalate
 
-    space.py set <id> --state blocked-on-user
-    space.py send outbox escalate "<one specific question>" --item <id>
+    space.py escalate <id> "<one specific question>"
 
 Do not send `finished`, and do not stop while other items are runnable: keep working through the
 loop. When nothing else can run, the gate exits 3 and you end with `waiting on user: L3`. The
-steward wakes, answers, restores the item to `delegated` (or `open` if it had no owner), sends a
-`steer`, and resumes you. Use this only for: a permission, a preference, or an instruction that
+steward answers with a `steer`, which puts the item back in work, and resumes you. Use this only for: a permission, a preference, or an instruction that
 could destroy something and has two readings. Every other item keeps moving.
 
 ## When the same failure happens twice
@@ -85,6 +82,6 @@ nobody will answer you except through the inbox.
 
 ## Rules
 
-- Never mark an item done without running the check yourself; a worker's prose is not evidence.
+- Never close an item on a worker's word. `done` runs the check; without one, you run it.
 - Never launch anything but `steward-worker`. Never talk to the user; the steward owns that channel.
 - One ledger item, one owner, one brief.

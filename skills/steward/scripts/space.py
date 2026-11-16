@@ -3,19 +3,33 @@
 
 All state is JSON lines under one directory. Mutations take a file lock and
 replace files atomically, so the steward and the orchestrator can share one
-brainspace from different processes.
+brainspace from different processes. Illegal state changes are refused here,
+so no prompt has to remember them.
 
-  space.py --dir DIR init [GOAL]                                 # create, keep an existing GOAL.md
-  space.py --dir DIR add "request in the user's words" [--owner A]  # open; owner is a hint
-  space.py --dir DIR set L3 [--state delegated] [--owner B] [--evidence "pytest: 212 passed"]
+Steward verbs (one per user act):
+  space.py --dir DIR init [GOAL]                      # create; keeps an existing GOAL.md
+  space.py --dir DIR task "request" [--check CMD]     # new item + directive; prints its id
+  space.py --dir DIR steer L3 "instruction"           # also the answer to an escalation; reopens L3
+  space.py --dir DIR cancel L3 "why"                  # item cancelled + directive
+  space.py --dir DIR note "standing rule"             # into GOAL.md and every later brief
+  space.py --dir DIR status [--stale MIN]             # phase, items, last worker lines
+
+Orchestrator verbs:
+  space.py --dir DIR assign L3 A --goal "..." --done "..." [--known "..."]   # brief + owner
+  space.py --dir DIR done L3 [--evidence "what you ran and saw"]   # runs the item's check if it has one
+  space.py --dir DIR escalate L3 "one specific question"           # item blocked + report
+  space.py --dir DIR send outbox milestone|finished "text"
+  space.py --dir DIR gate                             # 0 finished, 2 continue, 3 waiting on user
+
+Both:
   space.py --dir DIR list [--open]
-  space.py --dir DIR send inbox|outbox KIND "text" [--item L3]
-  space.py --dir DIR read inbox|outbox                           # print unread, does not consume
-  space.py --dir DIR ack inbox|outbox ID [ID...]                 # consume after handling
-  space.py --dir DIR agent B "brief text"                        # creates agents/B/ with BRIEF.md
-  space.py --dir DIR agent B --stdin                             # read the brief from stdin
-  space.py --dir DIR session [SESSION_ID] [--agent A]            # store/print a subagent session id
-  space.py --dir DIR gate                                        # 0 finished, 2 continue, 3 waiting on user
+  space.py --dir DIR read inbox|outbox                # print unacked lines; does not consume
+  space.py --dir DIR ack ID [ID...]                   # consume after handling (I1 inbox, O1 outbox)
+  space.py --dir DIR session [ID] [--agent A] [--replace]   # store or print a subagent session id
+
+Primitives (the verbs above are built from these):
+  add "request" [--owner A] [--check CMD] | set L3 [--state S] [--owner A] [--evidence E]
+  send inbox|outbox KIND "text" [--item L3] | agent A "brief" | agent A --stdin
 """
 
 from __future__ import annotations
@@ -24,6 +38,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -35,11 +50,24 @@ except ImportError:  # Windows: no lock; use WSL when the steward and orchestrat
     fcntl = None
 
 STATES = ["open", "delegated", "done", "blocked-on-user", "cancelled"]
+# The item lifecycle. Anything not listed is refused.
+TRANSITIONS = {
+    "open": {"delegated", "blocked-on-user", "cancelled", "done"},
+    "delegated": {"open", "blocked-on-user", "cancelled", "done"},
+    "blocked-on-user": {"open", "delegated", "cancelled"},
+    "done": {"open", "delegated"},  # reopened by a steer
+    "cancelled": {"open"},
+}
 FINAL = {"done", "cancelled"}
 MAY_END = FINAL | {"blocked-on-user"}
 INBOX_KINDS = ["task", "steer", "cancel", "note"]
 OUTBOX_KINDS = ["escalate", "milestone", "finished"]
 LETTER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+STAMP = "%Y-%m-%dT%H:%M:%S"
+
+
+class Refused(Exception):
+    """A command the state machine does not allow. The message says what to do instead."""
 
 
 def load(path: Path) -> list[dict]:
@@ -76,22 +104,129 @@ def locked(root: Path):
 
 
 def now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S")
+    return time.strftime(STAMP)
+
+
+def minutes_since(stamp: float) -> int:
+    return max(0, int((time.time() - stamp) // 60))
 
 
 def next_id(rows: list[dict]) -> str:
     highest = 0
     for r in rows:
-        if not r["id"].startswith("L"):
-            continue
         rest = r["id"][1:]
-        if rest.isdigit():
+        if r["id"].startswith("L") and rest.isdigit():
             highest = max(highest, int(rest))
     return f"L{highest + 1}"
 
 
+def find(rows: list[dict], item: str) -> dict:
+    for r in rows:
+        if r["id"] == item:
+            return r
+    raise Refused(f"no ledger item {item}")
+
+
+def check_letter(letter: str, what: str = "owner") -> None:
+    if not LETTER.fullmatch(letter):
+        raise Refused(f"{what} must be a single word, e.g. A")
+
+
+def move(row: dict, state: str | None = None, owner: str | None = None,
+         evidence: str | None = None) -> None:  # fmt: skip
+    """The only place an item changes. Enforces the lifecycle."""
+    old = row["state"]
+    new = state if state is not None else old
+    if owner:
+        check_letter(owner)
+    who = owner if owner is not None else row.get("owner", "")
+    if new != old and new not in TRANSITIONS[old]:
+        allowed = ", ".join(sorted(TRANSITIONS[old]))
+        raise Refused(f"{row['id']} is {old}; it cannot become {new} (allowed: {allowed})")
+    if new == "delegated" and not who:
+        raise Refused("delegated needs an owner")
+    if old == "done" and new != "done":
+        row["evidence"] = ""  # reopened work must be proven again
+    if evidence is not None:
+        row["evidence"] = evidence
+    if new == "done" and not str(row.get("evidence") or "").strip():
+        raise Refused(f"{row['id']} cannot be done without evidence: use `done {row['id']}`")
+    row["state"], row["owner"], row["updated"] = new, who, now()
+
+
+def restore(row: dict) -> None:
+    """Put a blocked or finished item back to work."""
+    if row["state"] in {"blocked-on-user", "done"}:
+        move(row, "delegated" if row.get("owner") else "open")
+
+
+def post(root: Path, box: str, kind: str, text: str, item: str = "") -> str:
+    """Append a mailbox line. The caller holds the lock and has validated the item."""
+    if not text.strip():
+        raise Refused(f"{kind} needs text")
+    path = root / f"{box.upper()}.jsonl"
+    rows = load(path)
+    row = {"id": f"{box[0].upper()}{len(rows) + 1}", "kind": kind,
+           "text": text, "item": item, "read": False, "at": now()}  # fmt: skip
+    save(path, [*rows, row])
+    return row["id"]
+
+
+def notes(root: Path) -> list[str]:
+    return [m.get("text", "") for m in load(root / "INBOX.jsonl") if m.get("kind") == "note"]
+
+
+def brief_text(root: Path, row: dict, letter: str, goal: str, done: str, known: str) -> str:
+    home = (root / "agents" / letter).resolve()
+    rules = "".join(f"\n   - {n}" for n in notes(root)) or " none"
+    check = f"\n   The orchestrator will run: `{row['check']}`" if row.get("check") else ""
+    return (
+        f"# Brief {letter} ({row['id']})\n\n"
+        f"Request: {row['request']}\n\n"
+        f"1. **Goal.** {goal.strip()}\n"
+        f"2. **Done.** {done.strip()}{check}\n"
+        f"3. **Known and off-limits.** {known.strip() or 'Nothing recorded.'}\n"
+        f"   Standing rules:{rules}\n"
+        f"4. **Your directory.** `{home}/`. Notes go in `notes/`, results in `out/`. Write nothing\n"
+        f"   outside it unless the goal names the file.\n"
+        f"5. **Survive.** After each step, append one line to `{home}/STATUS.md`: what is done,\n"
+        f"   where it is, what is next. You may be stopped without warning.\n"
+        f"6. **Report.** Under 200 words: what you did, the output of the done command, exact\n"
+        f"   paths, anything you could not determine. Do not ask questions; do not launch agents.\n"
+    )
+
+
+def write_agent(root: Path, letter: str, brief: str) -> Path:
+    check_letter(letter, "agent letter")
+    if not brief.strip():
+        raise Refused("agent needs a brief")
+    home = root / "agents" / letter
+    (home / "notes").mkdir(parents=True, exist_ok=True)
+    (home / "out").mkdir(exist_ok=True)
+    (home / "BRIEF.md").write_text(brief.strip() + "\n", encoding="utf-8")
+    (home / "STATUS.md").touch()
+    return home
+
+
+def session_of(root: Path, letter: str) -> str:
+    path = root / "agents" / letter / "SESSION" if letter else root / "SESSION"
+    return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+
+
+def advice(root: Path, r: dict) -> str:
+    """What the orchestrator should do about an unfinished item."""
+    if r["state"] == "open":
+        return f"assign it: `assign {r['id']} <letter> --goal ... --done ...`, then start the worker"
+    owner = r.get("owner") or ""
+    if not (root / "agents" / owner / "BRIEF.md").exists():
+        return f"{owner} has no brief: `assign {r['id']} {owner} --goal ... --done ...`"
+    if not session_of(root, owner):
+        return f"{owner} has a brief but no session: start the worker, then `session <id> --agent {owner}`"
+    return f"waiting on {owner}; when it reports, run its check and `done {r['id']}`"
+
+
 def gate(root: Path, quiet: bool = False) -> int:
-    """0: finished. 2: work or unread directives remain. 3: waiting on the user."""
+    """0: finished. 2: work or unacked directives remain. 3: waiting on the user."""
 
     def say(line: str) -> None:
         if not quiet:
@@ -104,17 +239,20 @@ def gate(root: Path, quiet: bool = False) -> int:
     unproven = [
         r for r in rows
         if r["state"] == "done" and not str(r.get("evidence") or "").strip()
-    ]
+    ]  # fmt: skip
 
     for r in active:
         say(f"NOT DONE {r['id']} [{r['state']}] owner={r['owner'] or '-'}: {r['request']}")
+        say(f"  -> {advice(root, r)}")
     for m in unread:
-        say(f"UNREAD {m['id']} [{m.get('kind', '?')}]: {m.get('text', '')} (ack inbox {m['id']} after handling)")
+        say(f"UNREAD {m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m.get('text', '')}")
+        say(f"  -> handle it, then `ack inbox {m['id']}`")
     for r in unproven:
         say(f"NO EVIDENCE {r['id']}: marked done without a check you ran")
+        say(f"  -> run the check, then `done {r['id']} --evidence \"...\"`")
 
     if active or unread or unproven:
-        say("Do not end the turn. Handle the lines above, then check the gate again.")
+        say("Do not end the run. Handle the lines above, then check the gate again.")
         return 2
     if waiting:
         for r in waiting:
@@ -149,20 +287,244 @@ def cmd_list(root: Path, open_only: bool) -> int:
     return 0
 
 
-def main() -> int:
+def cmd_status(root: Path, stale: int) -> int:
+    """One screen for the steward: enough to answer a status question or run a check-in."""
+    code = gate(root, quiet=True)
+    phase = {0: "finished", 2: "working", 3: "waiting on the user"}[code]
+    rows = load(root / "LEDGER.jsonl")
+    if not rows:
+        phase = "empty"
+    print(f"phase: {phase} (gate {code})")
+    print(f"orchestrator session: {session_of(root, '') or 'none'}")
+    for r in rows:
+        age = minutes_since(time.mktime(time.strptime(r["updated"], STAMP))) if r.get("updated") else 0
+        print(f"{r['id']} [{r['state']}] owner={r['owner'] or '-'} {age}m: {r['request']}")
+        if r["state"] == "done":
+            print(f"    evidence: {str(r.get('evidence') or 'NONE')[:160]}")
+        status = root / "agents" / (r.get("owner") or "-") / "STATUS.md"
+        if r["state"] in FINAL or not r.get("owner") or not status.exists():
+            continue
+        lines = [ln for ln in status.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        quiet = minutes_since(status.stat().st_mtime)
+        flag = f"  STALE: silent {quiet}m" if r["state"] == "delegated" and quiet >= stale else ""
+        print(f"    {r['owner']}: {lines[-1][:160] if lines else '(no status line yet)'}{flag}")
+    for box in ("inbox", "outbox"):
+        for m in load(root / f"{box.upper()}.jsonl"):
+            if not m.get("read"):
+                print(f"unacked {box} {m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: "
+                      f"{m.get('text', '')[:160]}")  # fmt: skip
+    return 0
+
+
+def cmd_done(root: Path, args: argparse.Namespace) -> int:
+    """Close an item. If it carries a check, the check decides, not the caller."""
+    row = find(load(root / "LEDGER.jsonl"), args.id)
+    evidence = (args.evidence or "").strip()
+    if row.get("check"):
+        try:
+            proc = subprocess.run(row["check"], shell=True, capture_output=True, text=True,
+                                  cwd=root.resolve().parent, timeout=args.timeout)  # fmt: skip
+            code, tail = proc.returncode, (proc.stdout + proc.stderr).strip()[-300:]
+        except subprocess.TimeoutExpired:
+            code, tail = 124, f"timed out after {args.timeout}s"
+        if code != 0:
+            print(f"check failed (exit {code}): {row['check']}\n{tail}", file=sys.stderr)
+            print(f"{args.id} stays {row['state']}. Send the failure back to its worker.", file=sys.stderr)
+            return 2
+        evidence = f"check `{row['check']}` exit 0: {tail} {evidence}".strip()
+    elif not evidence:
+        raise Refused(f'{args.id} has no check: `done {args.id} --evidence "<command you ran and what it printed>"`')
+    with locked(root):
+        rows = load(root / "LEDGER.jsonl")
+        move(find(rows, args.id), "done", evidence=evidence)
+        save(root / "LEDGER.jsonl", rows)
+    left = gate(root, quiet=True)
+    after = {0: 'every item is closed: `send outbox finished "<summary with evidence paths>"`',
+             2: "work remains: run `gate`", 3: "the rest waits on the user: end with `waiting on user`"}  # fmt: skip
+    print(f"{args.id} done; {after[left]}")
+    return 0
+
+
+def mutate(root: Path, args: argparse.Namespace) -> None:
+    """Every command that changes the ledger or a mailbox. Runs under the lock."""
+    ledger = root / "LEDGER.jsonl"
+    rows = load(ledger)
+    cmd = args.cmd
+
+    if cmd in {"add", "task"}:
+        if not args.request.strip():
+            raise Refused(f"{cmd} needs a request")
+        if args.owner:
+            check_letter(args.owner)
+        row = {"id": next_id(rows), "request": args.request, "owner": args.owner,
+               "state": "open", "evidence": "", "updated": now()}  # fmt: skip
+        if args.check:
+            row["check"] = args.check
+        save(ledger, [*rows, row])
+        if cmd == "task":
+            post(root, "inbox", "task", args.request, row["id"])
+        print(row["id"])
+    elif cmd == "set":
+        row = find(rows, args.id)
+        if args.state == "done" and row.get("check"):
+            raise Refused(f"{args.id} has a check; use `done {args.id}` so the check decides")
+        move(row, args.state, args.owner, args.evidence)
+        save(ledger, rows)
+    elif cmd == "steer":
+        row = find(rows, args.id)
+        if row["state"] == "cancelled":
+            raise Refused(f"{args.id} is cancelled; send a new `task` instead")
+        answered = row["state"] == "blocked-on-user"
+        restore(row)
+        save(ledger, rows)
+        mid = post(root, "inbox", "steer", args.text, args.id)
+        if answered:  # a decision outlives the item that asked for it
+            with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
+                fh.write(f"\n- Decision ({now()[:10]}, {args.id}): {args.text.strip()}\n")
+        print(mid)
+    elif cmd == "cancel":
+        row = find(rows, args.id)
+        if row["state"] == "done":
+            raise Refused(f"{args.id} is already done; `steer` it if the result must change")
+        if row["state"] == "cancelled":
+            raise Refused(f"{args.id} is already cancelled")
+        move(row, "cancelled")
+        save(ledger, rows)
+        print(post(root, "inbox", "cancel", args.text, args.id))
+    elif cmd == "note":
+        mid = post(root, "inbox", "note", args.text)
+        with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n- Standing rule ({now()[:10]}): {args.text.strip()}\n")
+        print(mid)
+    elif cmd == "escalate":
+        row = find(rows, args.id)
+        if not args.text.strip():
+            raise Refused("escalate needs one specific question")
+        move(row, "blocked-on-user")
+        save(ledger, rows)
+        print(post(root, "outbox", "escalate", args.text, args.id))
+    elif cmd == "assign":
+        row = find(rows, args.id)
+        check_letter(args.letter, "agent letter")
+        if row["state"] == "delegated" and row.get("owner") not in ("", args.letter):
+            raise Refused(f"{args.id} belongs to {row['owner']}; steer that worker, or `set {args.id} --state open` first")
+        if row["state"] == "blocked-on-user":
+            raise Refused(f"{args.id} waits on the user; only the steward's `steer` puts it back in work")
+        if row["state"] in FINAL:
+            raise Refused(f"{args.id} is {row['state']}; only the steward's `steer` or a new `task` reopens work")
+        busy = [r["id"] for r in rows
+                if r is not row and r.get("owner") == args.letter and r["state"] not in FINAL]  # fmt: skip
+        if busy:
+            raise Refused(f"{args.letter} already owns {busy[0]}; one worker, one item: pick another letter")
+        if not args.goal.strip() or not args.done.strip():
+            raise Refused("assign needs --goal and --done")
+        move(row, "delegated", args.letter)
+        home = write_agent(root, args.letter, brief_text(root, row, args.letter, args.goal, args.done, args.known))
+        save(ledger, rows)
+        print(home / "BRIEF.md")
+    elif cmd == "send":
+        send(root, rows, args)
+    elif cmd == "ack":
+        ids = list(args.ids)
+        box = ids.pop(0) if ids[0] in ("inbox", "outbox") else ""
+        if not ids:
+            raise Refused("ack needs a message id, e.g. `ack O1`")
+        acked = 0
+        for name in ("inbox", "outbox"):  # an id names its own mailbox: I1 or O1
+            wanted = {i for i in ids if i[:1].upper() == name[0].upper()}
+            if not wanted:
+                continue
+            if box and box != name:
+                raise Refused(f"{', '.join(sorted(wanted))} is not an {box} id")
+            path = root / f"{name.upper()}.jsonl"
+            msgs = load(path)
+            missing = wanted - {m["id"] for m in msgs}
+            if missing:
+                raise Refused(f"no message {', '.join(sorted(missing))} in {name}")
+            for m in msgs:
+                if m["id"] in wanted and not m.get("read"):
+                    m["read"] = True
+                    acked += 1
+            save(path, msgs)
+        unknown = [i for i in ids if i[:1].upper() not in ("I", "O")]
+        if unknown:
+            raise Refused(f"no message {', '.join(unknown)}: ids look like I1 (inbox) or O1 (outbox)")
+        print(f"acked {acked}")
+    elif cmd == "agent":
+        check_letter(args.letter, "agent letter")
+        if args.stdin and args.brief is not None:
+            raise Refused("agent takes a brief or --stdin, not both")
+        print(write_agent(root, args.letter, sys.stdin.read() if args.stdin else (args.brief or "")))
+    elif cmd == "session":
+        if args.agent is not None:
+            check_letter(args.agent, "agent letter")
+        home = root if not args.agent else root / "agents" / args.agent
+        if not home.is_dir():
+            raise Refused(f"no worker directory {home}")
+        old = session_of(root, args.agent or "")
+        if not args.id:
+            if not old:
+                raise Refused("no session recorded")
+            print(old)
+        elif old and old != args.id.strip() and not args.replace:
+            raise Refused(f"a session is already recorded ({old}): resume it. "
+                          "Pass --replace only if that session is gone")  # fmt: skip
+        else:
+            (home / "SESSION").write_text(args.id.strip() + "\n", encoding="utf-8")
+            print(args.id.strip())
+
+
+def send(root: Path, rows: list[dict], args: argparse.Namespace) -> None:
+    kinds = INBOX_KINDS if args.box == "inbox" else OUTBOX_KINDS
+    if args.kind not in kinds:
+        raise Refused(f"{args.box} kinds: {kinds}")
+    if not args.text.strip():
+        raise Refused("send needs text")
+    if args.box == "inbox" and args.kind != "note" and not args.item:
+        raise Refused(f"{args.kind} needs --item")
+    if args.kind == "escalate" and not args.item:
+        raise Refused("escalate needs --item")
+    if args.item:
+        row = find(rows, args.item)
+        if args.kind == "escalate" and row["state"] != "blocked-on-user":
+            raise Refused("escalate needs a blocked-on-user item")
+    if args.kind == "finished" and gate(root, quiet=True) != 0:
+        raise Refused("cannot send finished while the gate is open; run `gate` and do what it prints")
+    print(post(root, args.box, args.kind, args.text, args.item))
+
+
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--dir", required=True)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").add_argument("goal", nargs="?", default=None)
-    p = sub.add_parser("add")
-    p.add_argument("request")
-    p.add_argument("--owner", default="")
+    for name in ("add", "task"):
+        p = sub.add_parser(name)
+        p.add_argument("request")
+        p.add_argument("--owner", default="")
+        p.add_argument("--check", default="")
     p = sub.add_parser("set")
     p.add_argument("id")
     p.add_argument("--state", choices=STATES)
     p.add_argument("--owner")
     p.add_argument("--evidence")
+    for name in ("steer", "cancel", "escalate"):
+        p = sub.add_parser(name)
+        p.add_argument("id")
+        p.add_argument("text")
+    sub.add_parser("note").add_argument("text")
+    p = sub.add_parser("assign")
+    p.add_argument("id")
+    p.add_argument("letter")
+    p.add_argument("--goal", default="")
+    p.add_argument("--done", default="")
+    p.add_argument("--known", default="")
+    p = sub.add_parser("done")
+    p.add_argument("id")
+    p.add_argument("--evidence")
+    p.add_argument("--timeout", type=int, default=600)
     sub.add_parser("list").add_argument("--open", action="store_true")
+    sub.add_parser("status").add_argument("--stale", type=int, default=30)
     p = sub.add_parser("send")
     p.add_argument("box", choices=["inbox", "outbox"])
     p.add_argument("kind")
@@ -170,9 +532,7 @@ def main() -> int:
     p.add_argument("--item", default="")
     p = sub.add_parser("read")
     p.add_argument("box", choices=["inbox", "outbox"])
-    p = sub.add_parser("ack")
-    p.add_argument("box", choices=["inbox", "outbox"])
-    p.add_argument("ids", nargs="+")
+    sub.add_parser("ack").add_argument("ids", nargs="+", metavar="[inbox|outbox] ID")
     p = sub.add_parser("agent")
     p.add_argument("letter")
     p.add_argument("brief", nargs="?", default=None)
@@ -180,143 +540,38 @@ def main() -> int:
     p = sub.add_parser("session")
     p.add_argument("id", nargs="?", default=None)
     p.add_argument("--agent", default=None)
+    p.add_argument("--replace", action="store_true")
     sub.add_parser("gate")
-    args = ap.parse_args()
+    return ap
 
+
+def main() -> int:
+    args = parser().parse_args()
     root = Path(args.dir)
     if args.cmd == "init":
         return cmd_init(root, args.goal)
     if not root.is_dir() or not (root / "LEDGER.jsonl").exists():
         print(f"no brainspace at {root}; run init first", file=sys.stderr)
         return 1
-    if args.cmd == "gate":
-        return gate(root)
-    if args.cmd == "list":
-        return cmd_list(root, args.open)
-
-    with locked(root):
-        ledger = root / "LEDGER.jsonl"
-        if args.cmd == "add":
-            if not args.request.strip():
-                print("add needs a request", file=sys.stderr)
-                return 1
-            if args.owner and not LETTER.fullmatch(args.owner):
-                print("owner must be a single word, e.g. A", file=sys.stderr)
-                return 1
-            rows = load(ledger)
-            row = {"id": next_id(rows), "request": args.request, "owner": args.owner,
-                   "state": "open", "evidence": "", "updated": now()}  # fmt: skip
-            save(ledger, [*rows, row])
-            print(row["id"])
-        elif args.cmd == "set":
-            if args.owner and not LETTER.fullmatch(args.owner):
-                print("owner must be a single word, e.g. A", file=sys.stderr)
-                return 1
-            rows = load(ledger)
-            hit = [r for r in rows if r["id"] == args.id]
-            if not hit:
-                print(f"no ledger item {args.id}", file=sys.stderr)
-                return 1
-            state = args.state if args.state is not None else hit[0]["state"]
-            owner = args.owner if args.owner is not None else hit[0]["owner"]
-            if state == "delegated" and not owner:
-                print("delegated needs an owner", file=sys.stderr)
-                return 1
-            for key, val in (("state", args.state), ("owner", args.owner),
-                             ("evidence", args.evidence)):  # fmt: skip
-                if val is not None:
-                    hit[0][key] = val
-            hit[0]["updated"] = now()
-            save(ledger, rows)
-        elif args.cmd == "send":
-            kinds = INBOX_KINDS if args.box == "inbox" else OUTBOX_KINDS
-            if args.kind not in kinds:
-                print(f"{args.box} kinds: {kinds}", file=sys.stderr)
-                return 1
-            if not args.text.strip():
-                print("send needs text", file=sys.stderr)
-                return 1
-            if args.box == "inbox" and args.kind != "note" and not args.item:
-                print(f"{args.kind} needs --item", file=sys.stderr)
-                return 1
-            if args.box == "outbox" and args.kind == "escalate" and not args.item:
-                print("escalate needs --item", file=sys.stderr)
-                return 1
-            items = {r["id"]: r for r in load(ledger)}
-            if args.item and args.item not in items:
-                print(f"no ledger item {args.item}", file=sys.stderr)
-                return 1
-            if (
-                args.box == "outbox"
-                and args.kind == "escalate"
-                and items[args.item]["state"] != "blocked-on-user"
-            ):
-                print("escalate needs a blocked-on-user item", file=sys.stderr)
-                return 1
-            if args.box == "outbox" and args.kind == "finished" and gate(root, quiet=True) != 0:
-                print("cannot send finished while the gate is open", file=sys.stderr)
-                return 1
-            path = root / f"{args.box.upper()}.jsonl"
-            rows = load(path)
-            row = {"id": f"{args.box[0].upper()}{len(rows) + 1}", "kind": args.kind,
-                   "text": args.text, "item": args.item, "read": False, "at": now()}  # fmt: skip
-            rows.append(row)
-            save(path, rows)
-            print(row["id"])
-        elif args.cmd == "read":
-            path = root / f"{args.box.upper()}.jsonl"
-            for m in load(path):
+    try:
+        if args.cmd == "gate":
+            return gate(root)
+        if args.cmd == "list":
+            return cmd_list(root, args.open)
+        if args.cmd == "status":
+            return cmd_status(root, args.stale)
+        if args.cmd == "done":
+            return cmd_done(root, args)
+        if args.cmd == "read":
+            for m in load(root / f"{args.box.upper()}.jsonl"):
                 if not m.get("read"):
                     print(f"{m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m.get('text', '')}")
-        elif args.cmd == "ack":
-            path = root / f"{args.box.upper()}.jsonl"
-            rows = load(path)
-            wanted = set(args.ids)
-            missing = wanted - {m["id"] for m in rows}
-            if missing:
-                print(f"no message {', '.join(sorted(missing))} in {args.box}", file=sys.stderr)
-                return 1
-            acked = 0
-            for m in rows:
-                if m["id"] in wanted and not m.get("read"):
-                    m["read"] = True
-                    acked += 1
-            save(path, rows)
-            print(f"acked {acked}")
-        elif args.cmd == "agent":
-            if not LETTER.fullmatch(args.letter):
-                print("agent letter must be a single word, e.g. A", file=sys.stderr)
-                return 1
-            if args.stdin and args.brief is not None:
-                print("agent takes a brief or --stdin, not both", file=sys.stderr)
-                return 1
-            brief = sys.stdin.read() if args.stdin else (args.brief or "")
-            if not brief.strip():
-                print("agent needs a brief", file=sys.stderr)
-                return 1
-            home = root / "agents" / args.letter
-            (home / "notes").mkdir(parents=True, exist_ok=True)
-            (home / "out").mkdir(exist_ok=True)
-            (home / "BRIEF.md").write_text(brief.strip() + "\n", encoding="utf-8")
-            (home / "STATUS.md").touch()
-            print(home)
-        elif args.cmd == "session":
-            if args.agent is not None and not LETTER.fullmatch(args.agent):
-                print("agent letter must be a single word, e.g. A", file=sys.stderr)
-                return 1
-            home = root if not args.agent else root / "agents" / args.agent
-            if not home.is_dir():
-                print(f"no worker directory {home}", file=sys.stderr)
-                return 1
-            path = home / "SESSION"
-            if args.id:
-                path.write_text(args.id.strip() + "\n", encoding="utf-8")
-                print(args.id.strip())
-            elif path.exists() and path.read_text(encoding="utf-8").strip():
-                print(path.read_text(encoding="utf-8").strip())
-            else:
-                print("no session recorded", file=sys.stderr)
-                return 1
+            return 0
+        with locked(root):
+            mutate(root, args)
+    except Refused as err:
+        print(err, file=sys.stderr)
+        return 1
     return 0
 
 
