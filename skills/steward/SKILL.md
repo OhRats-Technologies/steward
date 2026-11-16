@@ -35,7 +35,8 @@ One directory, the brainspace. Keep it inside the project at `.steward/`; never 
 
 All commands run as `python3 <this skill>/scripts/space.py --dir .steward ...`; `--help` lists them.
 `read` prints unread lines and does not consume them. Act, then `ack` the ids. The gate stays
-blocked on unacked inbox lines.
+blocked on unacked inbox lines. The orchestrator reads and acks `INBOX.jsonl`; you read and ack
+`OUTBOX.jsonl`. Never ack the other tier's mailbox.
 
 State is JSON lines and plain files on purpose. You read the ledger and status files directly;
 SQLite would hide them behind queries and add a dependency. The writers are few (you and one
@@ -87,7 +88,7 @@ each idle produces a report in this session. That report is your wake.
 |---|---|
 | Task | `space.py add "..."`, then `send inbox task "..." --item <id>` |
 | Change to running work | `send inbox steer "<the new instruction>" --item <id>`; if the item is `done`, `set <id> --state open` first |
-| Answer to an escalation | `send inbox steer "<the answer>" --item <id>` |
+| Answer to an escalation | `send inbox steer "<the answer>" --item <id>`; `set <id> --state delegated` if it has an owner (otherwise `--state open`) |
 | Cancellation | `send inbox cancel "..." --item <id>`; `set <id> --state cancelled` |
 | Question | answer it yourself from `LEDGER.jsonl` and `agents/*/STATUS.md`. If the answer is not there, say so and route a lookup task as above |
 | Status check | read the ledger and status files; reply; send nothing |
@@ -96,7 +97,8 @@ each idle produces a report in this session. That report is your wake.
 A constraint stated beside a task is its own act. Reply to the user in the same turn: what you
 routed, what is running, what comes next.
 
-After sending a `task`, `steer`, `cancel` or `note`, wake the orchestrator with its session handle:
+After sending a `task`, `steer`, `cancel` or `note`, wake the orchestrator with its session handle
+(`space.py session` prints it):
 `subagent({ agent: "steward-orchestrator", description: "Continue", sessionID: "<SESSION>",
 prompt: "Continue." })`. A follow-up to a running child joins its run; to an idle one it starts a
 turn. Without it, a directive sits unread in a finished or waiting session.
@@ -109,12 +111,13 @@ turn. Without it, a directive sits unread in a finished or waiting session.
   Ack the outbox line after the wake. The orchestrator keeps working on other items while one is
   blocked; if it is still running, the follow-up joins its run. If the answer is the user's, ask
   one specific question, leave the item blocked, and do not wake it for that item; other work
-  keeps moving. When the answer arrives, send it as a steer and wake the orchestrator.
+  keeps moving. When the answer arrives, send it as a steer, restore the item's state, and wake
+  the orchestrator.
 - `finished`: run `space.py gate`. Exit 0 plus the goal's own done command is the only reason to
   tell the user it is done. Exit 3 means a user decision is still pending; handle it. Exit 2 means
   work remains. If the gate is 0 but the done command fails, add a task for the gap, wake the
   orchestrator, and do not report done. Ack the finished line after you act.
-- `milestone`: read it, ack it, end.
+- `milestone`: read it; if it names a rule that should change, edit the skill file; ack it; end.
 - A report that says only `waiting: A, B` is a check-in. Read the ledger and up to three
   `STATUS.md` files; correct drift with a steer or a note; end.
 - A report that says `waiting on user` with no outbox line: read the ledger for the

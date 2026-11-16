@@ -90,6 +90,19 @@ class SpaceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("needs a request", proc.stderr)
 
+    def test_add_rejects_a_path_owner(self) -> None:
+        self.init()
+        proc = self.space("add", "x", "--owner", "../A", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("owner must be", proc.stderr)
+
+    def test_set_rejects_a_path_owner(self) -> None:
+        self.init()
+        self.space("add", "x")
+        proc = self.space("set", "L1", "--owner", "../A", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("owner must be", proc.stderr)
+
     def test_set_unknown_id(self) -> None:
         self.init()
         proc = self.space("set", "L9", "--state", "done", ok=False)
@@ -133,6 +146,38 @@ class SpaceTest(unittest.TestCase):
         proc = self.space("send", "inbox", "task", "   ", ok=False)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("needs text", proc.stderr)
+
+    def test_send_targeted_kinds_need_an_item(self) -> None:
+        self.init()
+        for box, kind in (("inbox", "steer"), ("inbox", "cancel")):
+            with self.subTest(kind=kind):
+                proc = self.space("send", box, kind, "go", ok=False)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("needs --item", proc.stderr)
+        proc = self.space("send", "outbox", "escalate", "question", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("needs --item", proc.stderr)
+
+    def test_escalate_requires_a_blocked_item(self) -> None:
+        self.init()
+        self.space("add", "delete old data")
+        proc = self.space("send", "outbox", "escalate", "approve?", "--item", "L1", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("blocked-on-user", proc.stderr)
+        self.space("set", "L1", "--state", "blocked-on-user")
+        self.assertEqual(
+            self.space("send", "outbox", "escalate", "approve?", "--item", "L1").stdout.strip(),
+            "O1",
+        )
+
+    def test_finished_requires_a_closed_gate(self) -> None:
+        self.init()
+        self.space("add", "write it")
+        proc = self.space("send", "outbox", "finished", "done", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("gate is open", proc.stderr)
+        self.space("set", "L1", "--state", "done", "--evidence", "true")
+        self.assertEqual(self.space("send", "outbox", "finished", "done").stdout.strip(), "O1")
 
     def test_send_prints_the_message_id(self) -> None:
         self.init()

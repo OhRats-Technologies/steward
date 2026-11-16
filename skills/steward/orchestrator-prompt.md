@@ -26,8 +26,10 @@ Repeat until `space.py gate` exits 0 or 3:
      that request. Never add a second line for the same item.
    - `note`: a standing rule. Put it in every brief you write from now on.
 2. `space.py list --open`. Every item in state `open` gets a worker now; use its owner letter if
-   it has one. Skip `blocked-on-user`. Independent items go out together, in the same step. Do not
-   scout first when you already know the parts.
+   it has one. A `delegated` item whose owner has no recorded session also needs a worker: start
+   it from its existing brief, or write a new one if the old one is stale. Skip `blocked-on-user`.
+   Independent items go out together, in the same step. Do not scout first when you already know
+   the parts.
 3. For each worker report: its report is a claim. Run its check yourself. If its report says
    something did not work, it is not done: resume that worker with the failure and the check to
    run, or start a new worker if its session is gone. On a pass,
