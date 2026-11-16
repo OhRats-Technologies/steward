@@ -72,6 +72,9 @@ MAY_END = FINAL | {"blocked-on-user"}
 INBOX_KINDS = ["task", "steer", "cancel", "note"]
 DESTRUCTIVE = re.compile(r"\b(delete|remove|rm|clean(?: out| up)?|wipe|purge|drop|truncate|overwrite|reset|"
                          r"get rid of|prune|erase|force[- ]push)\b", re.IGNORECASE)
+NEGATED = re.compile(r"\b(?:do not|don't|dont|never|no|without|must not|mustn't)\s+(?:\w+\s+){0,2}?"
+                     r"(?:delete|remove|rm|clean(?: out| up)?|wipe|purge|drop|truncate|overwrite|reset|"
+                     r"get rid of|prune|erase|force[- ]push)\b", re.IGNORECASE)
 OUTBOX_KINDS = ["escalate", "milestone", "finished"]
 LETTER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 STAMP = "%Y-%m-%dT%H:%M:%S"
@@ -236,7 +239,8 @@ def notes(root: Path) -> list[str]:
 def brief_text(root: Path, row: dict, letter: str, goal: str, done: str, known: str) -> str:
     home = (root / "agents" / letter).resolve()
     sp = f"python3 {Path(__file__).resolve()} --dir {root.resolve()}"
-    why = lambda intent, text: f" --why '{intent}: {text}'" if (root / "DEBUG").exists() else ""  # noqa: E731
+    why = lambda intent, text: (f" --as {letter} --why '{intent}: {text}'"  # noqa: E731
+                                if (root / "DEBUG").exists() else "")
     rules = "".join(f"\n   - {n}" for n in notes(root)) or " none"
     check = f"\n   The orchestrator will run: `{row['check']}`" if row.get("check") else ""
     return (
@@ -254,7 +258,8 @@ def brief_text(root: Path, row: dict, letter: str, goal: str, done: str, known: 
         f"6. **Need an answer?** If you cannot finish without a fact or decision you cannot find,\n"
         f"   do not guess. Finish what does not depend on it, write that to STATUS.md, run\n"
         f"   `{sp} ask {letter} \"<one question>\"{why('ask', '<why you need it>')}`\n"
-        f"   and end your turn with `need: <the question>`. You are resumed with the answer.\n"
+        f"   and end your turn with `need: <the question>`. That line is your report; skip step 7.\n"
+        f"   You are resumed with the answer and finish then.\n"
         f"7. **Report.** Run `{sp} finish {letter}{why('report', '<what you finished>')}`. Then, under\n"
         f"   200 words: what you did, the output of the done command, exact paths, anything you\n"
         f"   could not determine or did not verify. Do not launch agents.\n"
@@ -366,7 +371,8 @@ def cmd_init(root: Path, goal: str | None) -> int:
         ignore.write_text("*\n", encoding="utf-8")
     print(root.resolve())
     if (root / "DEBUG").exists():
-        print(f"debug mode is on: add --why '<intent>: <reason>' to every call. Intents: {', '.join(INTENTS)}")
+        print(f"debug mode is on: add --why '<intent>: <reason>' and --as <steward|orchestrator|letter> to every "
+              f"call. Intents: {', '.join(INTENTS)}")
     return 0
 
 
@@ -619,7 +625,8 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
             raise Refused(f"{args.letter} already owns {busy[0]}; one worker, one item: pick another letter")
         if not args.goal.strip() or not args.done.strip():
             raise Refused("assign needs --goal and --done")
-        risky = DESTRUCTIVE.search(f"{row['request']} {args.goal}")
+        text = NEGATED.sub(" ", f"{row['request']} {args.goal}")  # "do not delete tests" deletes nothing
+        risky = DESTRUCTIVE.search(text)
         if risky and not (args.confirmed or "").strip():
             raise Refused(f"{args.id} deletes or overwrites ('{risky.group(0)}'). If the request or a decision "
                           "in GOAL.md names exactly what goes, quote it: --confirmed '<those words>'. If it "
@@ -785,7 +792,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("letter")
     p.add_argument("brief", nargs="?", default=None)
     p.add_argument("--stdin", action="store_true")
-    sub.add_parser("debug").add_argument("mode", choices=["on", "off"])
+    sub.add_parser("debug").add_argument("mode", choices=["on", "off", "report"])
     sub.add_parser("finish").add_argument("letter")
     p = sub.add_parser("open")
     p.add_argument("text")
@@ -813,18 +820,18 @@ WEAK_DONE = re.compile(r"(test|\[)\s+-[sfe]\s+\S+(\s*\])?(\s*&&\s*(test|\[)\s+-[
 INTENTS = ["explore", "ask", "answer", "route", "assign", "check", "close", "report", "wait", "fix"]
 
 
-def take_why(argv: list[str]) -> tuple[list[str], str | None]:
-    """Remove `--why TEXT` (or `--why=TEXT`) from anywhere in argv."""
-    out, why, i = [], None, 0
+def take_flag(argv: list[str], flag: str) -> tuple[list[str], str | None]:
+    """Remove `--flag TEXT` (or `--flag=TEXT`) from anywhere in argv."""
+    out, val, i = [], None, 0
     while i < len(argv):
-        if argv[i] == "--why" and i + 1 < len(argv):
-            why, i = argv[i + 1], i + 2
-        elif argv[i].startswith("--why="):
-            why, i = argv[i][6:], i + 1
+        if argv[i] == flag and i + 1 < len(argv):
+            val, i = argv[i + 1], i + 2
+        elif argv[i].startswith(flag + "="):
+            val, i = argv[i][len(flag) + 1:], i + 1
         else:
             out.append(argv[i])
             i += 1
-    return out, why
+    return out, val
 
 
 def dir_of(argv: list[str]) -> Path | None:
@@ -838,7 +845,8 @@ def dir_of(argv: list[str]) -> Path | None:
 
 def main() -> int:
     """Debug mode (`debug on` or STEWARD_DEBUG=1): every call states why, and every call is traced."""
-    argv, why = take_why(sys.argv[1:])
+    argv, why = take_flag(sys.argv[1:], "--why")
+    argv, who = take_flag(argv, "--as")
     root = dir_of(argv)
     debug = os.environ.get("STEWARD_DEBUG") == "1" or bool(root and (root / "DEBUG").exists())
     cmd = next((a for a in argv if a in COMMANDS), "")
@@ -852,9 +860,41 @@ def main() -> int:
     else:
         code = run(argv)
     with (root / "TRACE.jsonl").open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"at": now(), "argv": argv, "intent": intent.strip(), "why": reason.strip(),
+        fh.write(json.dumps({"at": now(), "as": who or "?", "argv": argv, "intent": intent.strip(), "why": reason.strip(),
                              "code": code}) + "\n")  # fmt: skip
     return code
+
+
+def behaviour(root: Path) -> str:
+    """What the run actually did, from TRACE.jsonl and the state: facts to set beside self-reports."""
+    trace = load(root / "TRACE.jsonl")
+    rows = load(root / "LEDGER.jsonl")
+    verb = lambda x: next((a for a in x["argv"] if a in COMMANDS), "?")  # noqa: E731
+    used: dict[str, int] = {}
+    for x in trace:
+        used[verb(x)] = used.get(verb(x), 0) + 1
+    workers = sorted(p.name for p in (root / "agents").glob("*") if (p / "SESSION").exists())
+    briefs = sorted(p.name for p in (root / "agents").glob("*") if (p / "BRIEF.md").exists())
+    refused = [x for x in trace if x["code"] == 1]
+    lines = [
+        f"orchestrator launched: {'yes' if (root / 'SESSION').exists() else 'NO'}",
+        f"workers briefed: {len(briefs)} {briefs}; with a recorded session: {len(workers)} {workers}",
+        f"items: {len(rows)} ({', '.join(f'{r['id']} {r['state']}' for r in rows) or 'none'}); "
+        f"split: {sum(1 for r in rows if r['state'] == 'split' or r.get('part_of'))}",
+        f"escalations: {used.get('escalate', 0)}; open requirements: {len(open_reqs(root))}; "
+        f"worker questions (ask): {used.get('ask', 0)}; tell: {used.get('tell', 0)}",
+        f"space.py calls: {len(trace)}, refused: {len(refused)}"
+        + (f" (first: {' '.join(refused[0]['argv'][2:5])})" if refused else ""),
+        "commands used: " + (", ".join(f"{k} x{v}" for k, v in sorted(used.items())) or "none"),
+        "by agent: " + "; ".join(
+            f"{w}: {sum(1 for x in trace if x.get('as', '?') == w)} calls, "
+            f"{sum(1 for x in trace if x.get('as', '?') == w and x['code'] == 1)} refused"
+            for w in sorted({x.get("as", "?") for x in trace})) if trace else "by agent: none",
+        f"gate now: {gate(root, quiet=True)} (0 finished, 2 work remains, 3 waiting on the user)",
+    ]
+    if not trace:
+        lines.insert(0, "NO space.py CALLS: the brainspace was never used")
+    return "\n".join(lines)
 
 
 def run(argv: list[str]) -> int:
@@ -863,6 +903,9 @@ def run(argv: list[str]) -> int:
     if args.cmd == "debug":
         root = Path(args.dir)
         flag = root / "DEBUG"
+        if args.mode == "report":
+            print(behaviour(root))
+            return 0
         if args.mode == "on":
             flag.write_text("every call needs --why '<intent>: <reason>'; trace in TRACE.jsonl\n")
         elif flag.exists():

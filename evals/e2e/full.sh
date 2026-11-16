@@ -10,7 +10,21 @@ python3 .opencode/skills/steward/scripts/space.py --dir .steward init >/dev/null
 git add -A; git -c user.name=e2e -c user.email=e2e@x commit -qm skill
 s=$(date +%s); PWD=$d timeout 3600 opencode run --model claude-agent/haiku --auto --format json "$([ "$MODE" = single ] || echo "Use the steward skill for this goal. ")$task" > $B/$n.events.jsonl 2> $B/$n.err; e=$(date +%s)
 echo "$n: $((e-s))s, check: $(./check.sh | tr '\n' ' ')" >> $B/summary.txt
-mk() { sed -e '1d;$d' -e "s|{WHO}|$1|g" -e "s|{THREAD}|${THREAD:-$B/thread.md}|g" -e "s|{ANSWER}|$d/.survey/$1.md|g" -e 's/^ONE LAST STEP (you are \(.*\))\. Your task is done; this does not change it\./This is the user who started this run. Your task is done; this request does not change it. You are \1./' $S/evals/e2e/survey.txt; }
+report() {
+  { [ -d .steward ] && python3 $S/skills/steward/scripts/space.py --dir .steward debug report || echo "no brainspace: the skill was not used"
+    echo "subagent launches by the steward: $(python3 -c "import json,sys;print(sum(1 for l in open(sys.argv[1]) if l.startswith('{') and json.loads(l).get('type')=='tool_use' and json.loads(l)['part'].get('tool')=='subagent'))" $B/$n.events.jsonl)"
+    echo "files changed: $(git status --short -- . ':!.steward' ':!.opencode' ':!.survey' | tr '\n' ' ')"; } > $B/$n.report.txt
+}
+report
+mk() { python3 - "$1" "$S/evals/e2e/survey.txt" "$B/$n.report.txt" "$d/.survey/$1.md" "${THREAD:-$B/thread.md}" <<'PY'
+import sys
+who, tpl, rep, ans, thread = sys.argv[1:]
+lines = open(tpl).read().splitlines()[1:-1]
+lines[0] = f"This is the user who started this run. Your task is done; this request does not change it. You are {who}."
+t = "\n".join(lines)
+print(t.replace("{WHO}", who).replace("{ANSWER}", ans).replace("{THREAD}", thread).replace("{REPORT}", open(rep).read().strip()))
+PY
+}
 sid=$(python3 -c "import json;print(json.loads(open('$B/$n.events.jsonl').readline())['sessionID'])")
 pids=""
 for pair in "steward:$sid" "orchestrator:$(cat .steward/SESSION 2>/dev/null)" $(for a in .steward/agents/*/; do l=$(basename $a); echo "worker-$l:$(cat $a/SESSION 2>/dev/null)"; done); do

@@ -5,8 +5,14 @@ Before you end your turn, read {THREAD}. It is the conversation in which
 the user and the developer built the skill you just worked under, and tested agents like you on
 it, including their failures.
 
+What the run actually did, measured from the state files and logs (not self-reported):
+
+{REPORT}
+
 Then write {ANSWER} (create the directory), under 300 words, plain and honest. Nothing here is
 graded, and criticism is what we want:
+0. Compare the measured record above with what your instructions said to do. Explain each gap
+   (a step skipped, a team not launched, a refused call not retried): what you were thinking.
 1. What in your instructions was unclear, contradictory or easy to miss? What did you skip,
    guess at, or do differently from what was written, and why?
 2. Where were you unsure but did not say so?
