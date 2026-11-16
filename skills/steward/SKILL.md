@@ -118,7 +118,7 @@ turn. Without it, a directive sits unread in a finished or waiting session.
 
 **A report from the orchestrator.** Read the outbox, handle it, ack it.
 
-- `escalate`: if `GOAL.md` already answers the question, do not ask the user: `steer <id>
+- `escalate`: `read outbox` prints any `GOAL.md` line that may answer it. If one does, do not ask the user: `steer <id>
   "<decision>"` (it records the decision in `GOAL.md` and acks the question), then wake the
   orchestrator. If the answer is the user's, ask one specific question, leave the item blocked and
   the line unacked (`ack` refuses it), and do not wake the orchestrator for that item; other work

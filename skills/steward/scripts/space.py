@@ -19,6 +19,10 @@ Orchestrator verbs:
   space.py --dir DIR done L3 [--evidence "what you ran and saw"]   # runs the item's check if it has one
   space.py --dir DIR escalate L3 "one specific question"           # item blocked + report
   space.py --dir DIR tell A "instruction"             # to a running worker; prints how to resume it
+  space.py --dir DIR ask A "question"                 # a worker's question; gate shows it until answered
+  space.py --dir DIR debug on|off                     # on: every call needs --why '<intent>: <reason>'
+                                                      # intents: explore ask answer route assign check
+                                                      # close report wait fix; trace in TRACE.jsonl
   space.py --dir DIR send outbox milestone|finished "text"
   space.py --dir DIR gate                             # 0 finished, 2 continue, 3 waiting on user
 
@@ -167,6 +171,28 @@ def restore(row: dict, rows: list[dict]) -> None:
         move(row, "delegated" if row.get("owner") else "open")
 
 
+WORD = re.compile(r"[a-z0-9][a-z0-9.+-]{2,}")
+COMMON = {"the", "and", "for", "with", "only", "not", "any", "all", "from", "this", "that", "should",
+          "before", "after", "into", "or", "now", "use", "which", "what", "when", "does", "are", "you"}
+
+
+def prior_answers(root: Path, question: str) -> list[str]:
+    """GOAL.md lines that share two words with a question: the user may have answered it already."""
+    words = set(WORD.findall(question.lower())) - COMMON
+    goal = root / "GOAL.md"
+    lines = goal.read_text(encoding="utf-8").splitlines() if goal.exists() else []
+    return [ln.strip() for ln in lines if len(words & set(WORD.findall(ln.lower()))) >= 2]
+
+
+def show_escalation(root: Path, m: dict) -> None:
+    hits = prior_answers(root, m.get("text", ""))
+    for ln in hits:
+        print(f"    GOAL.md already says: {ln}")
+    if hits:
+        print(f"    -> does that answer it? Then `steer {m.get('item')} '<the answer>'` and do not ask the "
+              "user. Ask only what GOAL.md leaves open.")  # fmt: skip
+
+
 def parts_of(rows: list[dict], item: str) -> list[dict]:
     return [r for r in rows if r.get("part_of") == item]
 
@@ -216,8 +242,12 @@ def brief_text(root: Path, row: dict, letter: str, goal: str, done: str, known: 
         f"5. **Survive.** After each step, append one line to `{home}/STATUS.md`: what is done,\n"
         f"   where it is, what is next. You may be stopped without warning. Before each step, read\n"
         f"   `{home}/notes/ORCHESTRATOR.md` if it exists: its lines override this brief.\n"
-        f"6. **Report.** Under 200 words: what you did, the output of the done command, exact\n"
-        f"   paths, anything you could not determine. Do not ask questions; do not launch agents.\n"
+        f"6. **Need an answer?** If you cannot finish without a fact or decision you cannot find,\n"
+        f"   do not guess. Finish what does not depend on it, write that to STATUS.md, run\n"
+        f"   `python3 {Path(__file__).resolve()} --dir {root.resolve()} ask {letter} \"<one question>\"`\n"
+        f"   and end your turn with `need: <the question>`. You are resumed with the answer.\n"
+        f"7. **Report.** Under 200 words: what you did, the output of the done command, exact\n"
+        f"   paths, anything you could not determine. Do not launch agents.\n"
     )
 
 
@@ -240,6 +270,10 @@ def session_of(root: Path, letter: str) -> str:
 
 def advice(root: Path, r: dict, rows: list[dict]) -> str:
     """What the orchestrator should do about an unfinished item."""
+    if r.get("question"):
+        return (f"{r['owner']} asks: {r['question']} -> answer from GOAL.md or a worker's out/ with "
+                f"`tell {r['owner']} '<answer>'` and resume it; if only the user can answer, "
+                f"`escalate {r['id']} '<the question>'`")  # fmt: skip
     if r["state"] == "split":
         left = [f"{p['id']} [{p['state']}]" for p in parts_of(rows, r["id"]) if p["state"] not in FINAL]
         return f"waits on its parts {', '.join(left)}" if left else f"every part is closed: `done {r['id']}`"
@@ -347,6 +381,8 @@ def cmd_status(root: Path, stale: int) -> int:
             if not m.get("read"):
                 print(f"unacked {box} {m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: "
                       f"{m.get('text', '')[:160]}")  # fmt: skip
+                if m.get("kind") == "escalate":
+                    show_escalation(root, m)
     return 0
 
 
@@ -487,10 +523,21 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
             fh.write(f"\n- Standing rule ({now()[:10]}): {args.text.strip()}\n")
         print(mid)
+    elif cmd == "ask":  # a worker's question, kept until the orchestrator answers or escalates it
+        check_letter(args.letter, "agent letter")
+        owned = [r for r in rows if r["owner"] == args.letter and r["state"] == "delegated"]
+        if not owned:
+            raise Refused(f"{args.letter} owns no delegated item")
+        if not args.text.strip():
+            raise Refused("ask needs one question")
+        owned[0]["question"] = args.text.strip()
+        save(ledger, rows)
+        print(f"recorded for {owned[0]['id']}; end your turn with `need: {args.text.strip()}`")
     elif cmd == "escalate":
         row = find(rows, args.id)
         if not args.text.strip():
             raise Refused("escalate needs one specific question")
+        row.pop("question", None)  # the worker's question is now the user's
         move(row, "blocked-on-user")
         save(ledger, rows)
         print(post(root, "outbox", "escalate", args.text, args.id))
@@ -564,6 +611,10 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         print(write_agent(root, args.letter, sys.stdin.read() if args.stdin else (args.brief or "")))
     elif cmd == "tell":
         check_letter(args.letter, "agent letter")
+        for r in rows:  # telling the worker is how its question is answered
+            if r["owner"] == args.letter and r["state"] == "delegated":
+                r.pop("question", None)
+        save(ledger, rows)
         owned = [r["id"] for r in rows if r["owner"] == args.letter and r["state"] == "delegated"]
         if not owned:
             raise Refused(f"{args.letter} owns no delegated item; put the instruction in the brief "
@@ -620,6 +671,10 @@ def send(root: Path, rows: list[dict], args: argparse.Namespace) -> None:
     print(post(root, args.box, args.kind, args.text, args.item))
 
 
+COMMANDS = {"init", "add", "task", "set", "steer", "cancel", "escalate", "note", "assign", "done", "list",
+            "status", "send", "read", "ack", "agent", "session", "gate", "tell", "ask", "help", "debug"}
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--dir", required=True)
@@ -670,6 +725,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("letter")
     p.add_argument("brief", nargs="?", default=None)
     p.add_argument("--stdin", action="store_true")
+    sub.add_parser("debug").add_argument("mode", choices=["on", "off"])
+    p = sub.add_parser("ask")
+    p.add_argument("letter")
+    p.add_argument("text")
     p = sub.add_parser("tell")
     p.add_argument("letter")
     p.add_argument("text")
@@ -682,9 +741,65 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+INTENTS = ["explore", "ask", "answer", "route", "assign", "check", "close", "report", "wait", "fix"]
+
+
+def take_why(argv: list[str]) -> tuple[list[str], str | None]:
+    """Remove `--why TEXT` (or `--why=TEXT`) from anywhere in argv."""
+    out, why, i = [], None, 0
+    while i < len(argv):
+        if argv[i] == "--why" and i + 1 < len(argv):
+            why, i = argv[i + 1], i + 2
+        elif argv[i].startswith("--why="):
+            why, i = argv[i][6:], i + 1
+        else:
+            out.append(argv[i])
+            i += 1
+    return out, why
+
+
+def dir_of(argv: list[str]) -> Path | None:
+    for i, a in enumerate(argv):
+        if a == "--dir" and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if a.startswith("--dir="):
+            return Path(a[6:])
+    return None
+
+
 def main() -> int:
+    """Debug mode (`debug on` or STEWARD_DEBUG=1): every call states why, and every call is traced."""
+    argv, why = take_why(sys.argv[1:])
+    root = dir_of(argv)
+    debug = os.environ.get("STEWARD_DEBUG") == "1" or bool(root and (root / "DEBUG").exists())
+    cmd = next((a for a in argv if a in COMMANDS), "")
+    if not debug or cmd in ("", "help", "debug"):
+        return run(argv)
+    intent, _, reason = (why or "").partition(":")
+    if intent.strip() not in INTENTS or not reason.strip():
+        code, err = 1, (f"debug mode: say why. Add --why '<intent>: <reason>', intent one of "
+                        f"{', '.join(INTENTS)}. Example: --why 'check: L2 reported done; run its check'")
+        print(err, file=sys.stderr)
+    else:
+        code = run(argv)
+    with (root / "TRACE.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": now(), "argv": argv, "intent": intent.strip(), "why": reason.strip(),
+                             "code": code}) + "\n")  # fmt: skip
+    return code
+
+
+def run(argv: list[str]) -> int:
     ap = parser()
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.cmd == "debug":
+        root = Path(args.dir)
+        flag = root / "DEBUG"
+        if args.mode == "on":
+            flag.write_text("every call needs --why '<intent>: <reason>'; trace in TRACE.jsonl\n")
+        elif flag.exists():
+            flag.unlink()
+        print(f"debug {'on' if flag.exists() else 'off'}")
+        return 0
     if args.cmd == "help":
         if args.command:
             ap.parse_args(["--dir", args.dir, args.command, "--help"])  # prints that command's help, exits 0
@@ -709,6 +824,8 @@ def main() -> int:
             for m in load(root / f"{args.box.upper()}.jsonl"):
                 if not m.get("read"):
                     print(f"{m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m.get('text', '')}")
+                    if m.get("kind") == "escalate":
+                        show_escalation(root, m)
             return 0
         with locked(root):
             mutate(root, args)

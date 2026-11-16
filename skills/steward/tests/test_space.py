@@ -685,5 +685,54 @@ class SpaceTest(unittest.TestCase):
         self.assertIn("L2 already is this part", proc.stderr)
         self.assertEqual(len(self.rows("LEDGER.jsonl")), 2)
 
+    def test_an_escalation_shows_what_goal_md_already_says(self) -> None:
+        self.init("Ship the notes.\nRelease notes are English only.\nDo not touch vendor/.")
+        self.space("add", "notes")
+        self.space("escalate", "L1", "Release notes in English only, or English plus French?")
+        out = self.space("read", "outbox").stdout
+        self.assertIn("GOAL.md already says: Release notes are English only.", out)
+        self.assertNotIn("vendor", out)
+        self.assertIn("GOAL.md already says", self.space("status").stdout)
+
+    def test_an_open_question_shows_no_false_answer(self) -> None:
+        self.init("Ship the docs.")
+        self.space("add", "deploy")
+        self.space("escalate", "L1", "Push to production now, or hold until Friday?")
+        self.assertNotIn("already says", self.space("read", "outbox").stdout)
+
+    def test_a_worker_question_stays_on_the_gate_until_answered(self) -> None:
+        self.delegated()
+        self.assertIn("ask A", (self.dir / "agents" / "A" / "BRIEF.md").read_text())
+        self.space("ask", "A", "Which tagline did the maintainer approve?")
+        self.assertIn("A asks: Which tagline", self.space("gate", ok=False).stdout)
+        self.space("tell", "A", "use: Count anything")
+        self.assertNotIn("asks", self.space("gate", ok=False).stdout)
+
+    def test_escalating_a_worker_question_moves_it_to_the_user(self) -> None:
+        self.delegated()
+        self.space("ask", "A", "Which tagline?")
+        self.space("escalate", "L1", "Which tagline did you approve?")
+        self.assertNotIn("question", self.rows("LEDGER.jsonl")[0])
+
+    def test_debug_mode_requires_a_reason_and_traces_every_call(self) -> None:
+        self.init()
+        self.space("debug", "on")
+        proc = self.space("task", "x", ok=False)
+        self.assertIn("--why '<intent>: <reason>'", proc.stderr)
+        self.assertFalse(self.rows("LEDGER.jsonl"))
+        self.space("task", "x", "--why", "route: the user asked for x")
+        self.space("--why=explore: what is open", "list")
+        trace = self.rows("TRACE.jsonl")
+        self.assertEqual([(r["intent"], r["code"]) for r in trace], [("", 1), ("route", 0), ("explore", 0)])
+        self.assertEqual(trace[1]["why"], "the user asked for x")
+        self.space("debug", "off")
+        self.space("list")
+        self.assertEqual(len(self.rows("TRACE.jsonl")), 3)
+
+    def test_debug_mode_rejects_an_unknown_intent(self) -> None:
+        self.init()
+        self.space("debug", "on")
+        self.assertIn("intent one of", self.space("list", "--why", "because: yes", ok=False).stderr)
+
 if __name__ == "__main__":
     unittest.main()

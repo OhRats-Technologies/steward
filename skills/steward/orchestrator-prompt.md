@@ -26,7 +26,10 @@ Repeat until `space.py gate` exits 0 or 3:
 2. `space.py gate`. It prints every unfinished item and the next step for each. Do them all:
    every `open` item gets a worker now (see below). Skip `blocked-on-user`. Independent items go
    out together, in the same step. Do not scout first when you already know the parts.
-3. For each worker report: its report is a claim. `space.py done <id>` runs the item's check and
+3. A report that ends `need: <question>` is a question, not a failure; `gate` shows it. Answer
+   it from `GOAL.md` or another worker's `out/` with `tell A '<answer>'` and resume A. If only
+   the user can answer, `escalate`. Never answer from memory.
+4. For each worker report: its report is a claim. `space.py done <id>` runs the item's check and
    closes the item only if it passes. If the item has no check, run the brief's done command
    yourself and pass `--evidence "<the command and what it printed>"`. If the check fails or the
    report says something did not work, the item is not done and stays with its worker:
@@ -34,8 +37,8 @@ Repeat until `space.py gate` exits 0 or 3:
    assign a new letter if its session is gone. A worker that is stuck on a missing file or
    fact: `add 'find <the fact>'` as its own item, assign it to a new letter, and `tell A` to wait
    for the answer in that worker's `out/`. That is not an escalation, and the item stays with A.
-4. When several items finish, `space.py send outbox milestone "<what is done, what is running>"`.
-5. If no report is ready and no other work can run, end with `waiting: A, B`. Do not spin on the
+5. When several items finish, `space.py send outbox milestone "<what is done, what is running>"`.
+6. If no report is ready and no other work can run, end with `waiting: A, B`. Do not spin on the
    gate; their reports wake you.
 
 `gate` exit codes: 0 finished, 2 keep going, 3 waiting on the user. Never treat 2 or 3 as done.
