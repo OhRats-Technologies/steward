@@ -74,6 +74,21 @@ OpenCode defaults to 1, which lets you launch the orchestrator but stops the orc
 launching workers. The launching session needs the `subagent` tool and permission to launch
 `steward-orchestrator`.
 
+## Team or solo
+
+When the user asks for the steward skill, run the team. Solo is allowed only when the whole
+change is in **one file**; count the files before deciding. Solo still uses the brainspace:
+`task` it with its `--check`, do the change, `done` it (the check decides), and tell the user you
+skipped the team. In solo mode you may read and edit that one file; the "do not read code" rule
+is for team runs. Solo is never a way around a check or a question: a conflict is escalated
+before you change anything it touches.
+
+A contradiction only the user can settle (a spec against a test, two instructions): `escalate
+<id> "<question>"`. Any tier may escalate. The item blocks, the gate waits on the user, and you
+ask them. Never pick a side silently.
+
+`.steward/DEBUG` is created by `space.py debug on`; while it exists every call needs `--why`.
+
 ## Start
 
 1. `python3 .opencode/skills/steward/scripts/space.py --dir .steward init`
