@@ -13,6 +13,8 @@ Steward verbs (one per user act):
   space.py --dir DIR cancel L3 "why"                  # item cancelled + directive
   space.py --dir DIR note "standing rule"             # into GOAL.md and every later brief
   space.py --dir DIR status [--stale MIN]             # phase, items, last worker lines
+  space.py --dir DIR open "requirement" [--item L3]   # a requirement no check covers; blocks finish
+  space.py --dir DIR resolve R1 "how it was met"      # records it; the gate may then finish
 
 Orchestrator verbs:
   space.py --dir DIR assign L3 A --goal "..." --done "..." [--known "..."]   # brief + owner
@@ -62,7 +64,7 @@ TRANSITIONS = {
     "split": {"open", "blocked-on-user", "cancelled", "done"},  # waits on its parts
     "delegated": {"open", "blocked-on-user", "cancelled", "done"},
     "blocked-on-user": {"open", "split", "delegated", "cancelled"},
-    "done": {"open", "delegated"},  # reopened by a steer
+    "done": {"open", "delegated", "blocked-on-user"},  # reopened by a steer or an escalation
     "cancelled": {"open"},
 }
 FINAL = {"done", "cancelled"}
@@ -191,6 +193,11 @@ def show_escalation(root: Path, m: dict) -> None:
     if hits:
         print(f"    -> does that answer it? Then `steer {m.get('item')} '<the answer>'` and do not ask the "
               "user. Ask only what GOAL.md leaves open.")  # fmt: skip
+
+
+def open_reqs(root: Path) -> list[tuple[str, str, str]]:
+    """Requirements no check covers and nobody has met: (id, item, text). The script owns the file."""
+    return [(r["id"], r.get("item", ""), r["text"]) for r in load(root / "REQUIRE.jsonl") if not r.get("met")]
 
 
 def parts_of(rows: list[dict], item: str) -> list[dict]:
@@ -329,7 +336,13 @@ def gate(root: Path, quiet: bool = False) -> int:
     if active or unread or unproven:
         say("Do not end the run. Handle the lines above, then check the gate again.")
         return 2
-    if waiting:
+    reqs = open_reqs(root)
+    for rid, item, text in reqs:
+        say(f"OPEN {rid}{' [' + item + ']' if item else ''}: {text}")
+    if reqs:
+        say("  -> a requirement in GOAL.md is not met. It is the user's to answer: the steward asks, then "
+            "`resolve <R> '<answer>'`. Not finished.")  # fmt: skip
+    if waiting or reqs:
         for r in waiting:
             say(f"WAITING {r['id']} owner={r['owner'] or '-'}: {r['request']}")
         say("Waiting on a user decision. End the turn without `finished`; the steward will resume you.")
@@ -370,9 +383,11 @@ def cmd_status(root: Path, stale: int) -> int:
     code = gate(root, quiet=True)
     phase = {0: "finished", 2: "working", 3: "waiting on the user"}[code]
     rows = load(root / "LEDGER.jsonl")
-    if not rows:
+    if not rows and code == 0:
         phase = "empty"
     print(f"phase: {phase} (gate {code})")
+    for rid, item, text in open_reqs(root):
+        print(f"OPEN {rid}{' [' + item + ']' if item else ''}: {text}  (ask the user; then `resolve {rid} '...'`)")
     print(f"orchestrator session: {session_of(root, '') or 'none'}")
     for r in rows:
         age = minutes_since(time.mktime(time.strptime(r["updated"], STAMP))) if r.get("updated") else 0
@@ -401,6 +416,10 @@ def cmd_done(root: Path, args: argparse.Namespace) -> int:
     rows = load(root / "LEDGER.jsonl")
     row = find(rows, args.id)
     evidence = (args.evidence or "").strip()
+    blocking = [rid for rid, item, _ in open_reqs(root) if item == args.id]
+    if blocking:
+        raise Refused(f"{args.id} has an open requirement {', '.join(blocking)} in GOAL.md; it is not done until "
+                      f"`resolve {blocking[0]} '<answer>'`. Escalate it if only the user can answer")  # fmt: skip
     parts = parts_of(rows, args.id)
     left = [p["id"] for p in parts if p["state"] not in FINAL]
     if left:
@@ -533,6 +552,27 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
             fh.write(f"\n- Standing rule ({now()[:10]}): {args.text.strip()}\n")
         print(mid)
+    elif cmd == "open":  # a requirement no check covers; kept out of GOAL.md, which models rewrite
+        if args.item:
+            find(rows, args.item)
+        if not args.text.strip():
+            raise Refused("open needs the requirement")
+        reqs = load(root / "REQUIRE.jsonl")
+        rid = f"R{len(reqs) + 1}"
+        save(root / "REQUIRE.jsonl", [*reqs, {"id": rid, "item": args.item, "text": args.text.strip(), "met": "", "at": now()}])
+        print(rid)
+    elif cmd == "resolve":
+        reqs = load(root / "REQUIRE.jsonl")
+        hit = [r for r in reqs if r["id"] == args.id and not r.get("met")]
+        if not hit:
+            raise Refused(f"no open requirement {args.id}; open ones: {[r for r, _, _ in open_reqs(root)] or 'none'}")
+        if not args.text.strip():
+            raise Refused("resolve needs how it was met")
+        hit[0]["met"] = args.text.strip()
+        save(root / "REQUIRE.jsonl", reqs)
+        with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n- Decision ({now()[:10]}, {args.id}): {hit[0]['text']} -> {args.text.strip()}\n")
+        print(f"{args.id} met")
     elif cmd == "finish":  # a worker's last step before its report
         check_letter(args.letter, "agent letter")
         status = root / "agents" / args.letter / "STATUS.md"
@@ -691,7 +731,7 @@ def send(root: Path, rows: list[dict], args: argparse.Namespace) -> None:
     print(post(root, args.box, args.kind, args.text, args.item))
 
 
-COMMANDS = {"finish", "init", "add", "task", "set", "steer", "cancel", "escalate", "note", "assign", "done", "list",
+COMMANDS = {"open", "resolve", "finish", "init", "add", "task", "set", "steer", "cancel", "escalate", "note", "assign", "done", "list",
             "status", "send", "read", "ack", "agent", "session", "gate", "tell", "ask", "help", "debug"}
 
 
@@ -747,6 +787,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--stdin", action="store_true")
     sub.add_parser("debug").add_argument("mode", choices=["on", "off"])
     sub.add_parser("finish").add_argument("letter")
+    p = sub.add_parser("open")
+    p.add_argument("text")
+    p.add_argument("--item", default="")
+    p = sub.add_parser("resolve")
+    p.add_argument("id")
+    p.add_argument("text")
     p = sub.add_parser("ask")
     p.add_argument("letter")
     p.add_argument("text")

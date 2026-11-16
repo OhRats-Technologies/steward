@@ -92,6 +92,12 @@ command or a `git diff` to check a result is not that, and is your job.
 
     space.py escalate <id> "<one specific question>"
 
+A requirement the check cannot see is not met because the check passes. If the goal asks for
+something you do not have, `escalate` the item rather than close it; `escalate` works on a done
+item too and reopens it. `gate` lists `OPEN R<n>` requirements from `GOAL.md`: they are the
+user's, so the run waits; `resolve` one only when a worker's result or a decision in `GOAL.md`
+meets it.
+
 Do not send `finished`, and do not stop while other items are runnable: keep working through the
 loop. When nothing else can run, the gate exits 3 and you end with `waiting on user: L3`. The
 steward answers with a `steer`, which puts the item back in work, and resumes you. Use this only for: a permission, a preference, or an instruction that

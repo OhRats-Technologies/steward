@@ -759,5 +759,42 @@ class SpaceTest(unittest.TestCase):
         self.space("debug", "on")
         self.assertIn("debug mode is on: add --why", self.space("init").stdout)
 
+    def test_an_open_requirement_blocks_done_and_finish_until_resolved(self) -> None:
+        self.init()
+        self.space("task", "translate")
+        self.space("ack", "I1")
+        self.assertEqual(self.space("open", "French opens with the approved tagline", "--item", "L1").stdout.strip(), "R1")
+        proc = self.space("done", "L1", "--evidence", "check passed", ok=False)
+        self.assertIn("open requirement R1", proc.stderr)
+        self.space("resolve", "R1", "tagline: Count anything")
+        self.space("done", "L1", "--evidence", "check passed")
+        self.assertEqual(self.space("gate", ok=False).returncode, 0)
+        self.assertIn("Decision", (self.dir / "GOAL.md").read_text())
+
+    def test_rewriting_goal_md_cannot_erase_an_open_requirement(self) -> None:
+        self.init()
+        self.space("task", "translate")
+        self.space("open", "tagline", "--item", "L1")
+        (self.dir / "GOAL.md").write_text("# Goal\nrewritten by a model\n")
+        self.assertIn("open requirement R1", self.space("done", "L1", "--evidence", "ok", ok=False).stderr)
+
+    def test_an_unlinked_open_requirement_keeps_the_run_waiting_on_the_user(self) -> None:
+        self.init()
+        self.space("open", "the maintainer approves the wording")
+        gate = self.space("gate", ok=False)
+        self.assertEqual(gate.returncode, 3)
+        self.assertIn("OPEN R1: the maintainer approves", gate.stdout)
+        self.assertIn("phase: waiting on the user", self.space("status").stdout)
+        proc = self.space("send", "outbox", "finished", "all done", ok=False)
+        self.assertIn("gate is open", proc.stderr)
+
+    def test_escalate_reopens_a_done_item_and_clears_its_evidence(self) -> None:
+        self.init()
+        self.space("add", "x")
+        self.space("done", "L1", "--evidence", "ran it")
+        self.space("escalate", "L1", "Which tagline?")
+        row = self.rows("LEDGER.jsonl")[0]
+        self.assertEqual((row["state"], row["evidence"]), ("blocked-on-user", ""))
+
 if __name__ == "__main__":
     unittest.main()

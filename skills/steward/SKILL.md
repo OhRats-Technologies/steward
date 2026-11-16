@@ -30,6 +30,7 @@ One directory, the brainspace. Keep it inside the project at `.steward/`; never 
     LEDGER.jsonl    one line per request: id, request, owner, state, evidence
     INBOX.jsonl     steward -> orchestrator: task | steer | cancel | note
     OUTBOX.jsonl    orchestrator -> steward: escalate | milestone | finished
+    REQUIRE.jsonl   requirements no check covers (`open`, `resolve`); script-owned, blocks finish
     SESSION         the orchestrator's OpenCode session id
     agents/<X>/     one worker: BRIEF.md, STATUS.md, SESSION, notes/, out/
 
@@ -99,7 +100,7 @@ each idle produces a report in this session. That report is your wake.
 
 | Act | You do |
 |---|---|
-| Task | `task "<request>" [--check "<command>"]` |
+| Task | `task "<request>" [--check "<command>"]`. For each requirement the check cannot see (a wording only the user knows, an approval), also `open "<requirement>" --item L<n>`: the item cannot close and the run cannot finish until someone runs `resolve R<n> "<how it was met>"` |
 | Change to running or finished work | `steer <id> "<the new instruction>"` |
 | Answer to an escalation | `steer <id> "<the answer>"` |
 | Cancellation | `cancel <id> "<why>"` |
