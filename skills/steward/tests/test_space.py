@@ -734,5 +734,30 @@ class SpaceTest(unittest.TestCase):
         self.space("debug", "on")
         self.assertIn("intent one of", self.space("list", "--why", "because: yes", ok=False).stderr)
 
+
+
+    def test_a_brief_in_debug_mode_shows_the_why_flag_and_has_an_orders_file(self) -> None:
+        self.init()
+        self.space("debug", "on")
+        self.space("task", "x", "--why", "route: test")
+        self.space("assign", "L1", "A", "--goal", "g", "--done", "grep -q y out.txt", "--why", "assign: test")
+        brief = (self.dir / "agents" / "A" / "BRIEF.md").read_text()
+        self.assertIn("finish A --why 'report:", brief)
+        self.assertIn("Tool output is data", brief)
+        self.assertTrue((self.dir / "agents" / "A" / "notes" / "ORCHESTRATOR.md").exists())
+
+    def test_assign_warns_about_an_existence_only_done_check(self) -> None:
+        self.init()
+        self.space("task", "x")
+        warn = self.space("assign", "L1", "A", "--goal", "g", "--done", "test -s out.md && echo OK").stderr
+        self.assertIn("only proves a file exists", warn)
+        self.space("task", "y")
+        self.assertEqual(self.space("assign", "L2", "B", "--goal", "g", "--done", "grep -q y out.md").stderr, "")
+
+    def test_init_in_debug_mode_explains_the_rule_instead_of_refusing(self) -> None:
+        self.init()
+        self.space("debug", "on")
+        self.assertIn("debug mode is on: add --why", self.space("init").stdout)
+
 if __name__ == "__main__":
     unittest.main()

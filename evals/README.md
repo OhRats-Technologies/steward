@@ -117,3 +117,14 @@ one is needed before tuning again.
 - Three trials per scenario is few. Scenario-level numbers move between runs.
 - Only state commands are tested. The model cannot launch subagents or run a shell here.
 - The scenarios were written by one model from the skill text, so they share its reading of it.
+
+## End to end, with a self-survey (`e2e/`)
+
+`e2e/full.sh <name> "<task>"` runs a real Haiku team in OpenCode on the fixture repo in
+`e2e/base/` with debug mode on, then resumes every session (steward, orchestrator, each worker)
+with `e2e/survey.txt` as a user message: what was unclear, where it was unsure, the one change
+that would help most. Answers land in `<run>/.steward/survey/`. `THREAD=<file>` names a
+transcript for the agents to read; `E2E_DIR` sets where runs go (default `/tmp/steward-e2e`).
+
+The survey is sent after the run, as the user. Shown inside command output during the run, it was
+refused as injected text by most agents, which is the behavior we want from them.

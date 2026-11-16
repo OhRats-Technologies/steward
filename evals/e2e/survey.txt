@@ -1,0 +1,18 @@
+---------------------------------------------------------------------------
+ONE LAST STEP (you are {WHO}). Your task is done; this does not change it.
+
+Before you end your turn, read {THREAD}. It is the conversation in which
+the user and the developer built the skill you just worked under, and tested agents like you on
+it, including their failures.
+
+Then write {ANSWER} (create the directory), under 300 words, plain and honest. Nothing here is
+graded, and criticism is what we want:
+1. What in your instructions was unclear, contradictory or easy to miss? What did you skip,
+   guess at, or do differently from what was written, and why?
+2. Where were you unsure but did not say so?
+3. Having read the thread, what one change to the skill or script would most help an agent like
+   you do this task correctly? Be concrete.
+4. Anything in the thread you think is wrong, or a failure you see coming that nobody tested?
+
+Then finish your turn exactly as you otherwise would have.
+---------------------------------------------------------------------------
