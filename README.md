@@ -91,9 +91,12 @@ now explicit in `space.py`, which refuses an illegal step and says what to do in
 |---|---|---|
 | Item | `open → delegated → done`, `blocked-on-user`, `cancelled` | A transition table. `done` needs evidence; a reopened item loses its old evidence |
 | Proof | claimed → checked | An item can carry `--check`. `done` runs it and closes the item only on exit 0, so a worker's word cannot close it |
-| Escalation | asked → answered | `escalate` blocks the item and reports in one step. `steer` unblocks it and records the decision in `GOAL.md` |
+| Escalation | asked → answered | `escalate` blocks the item and reports in one step. The question cannot be acked while open; the `steer` that answers it unblocks the item, acks the question and records the decision in `GOAL.md` |
 | Directive | sent → read → acked | `read` does not consume; the gate stays closed until `ack` |
-| Brief | none → written → session recorded | `assign` writes all six parts and every standing rule. One worker owns one item; only open work can be assigned |
+| Brief | none → written → session recorded | `assign` writes all six parts and every standing rule. One worker owns one item; only open work can be assigned. Work that deletes or overwrites needs `--confirmed '<the words naming what goes>'`, otherwise the refusal says to escalate |
+| Decomposition | open → split → done | `add '<part>' --part-of L1 [--after L2]` splits an item. A split item cannot be assigned; a part cannot start before what it waits for is done; the whole closes only after every part; cancelling it cancels its open parts |
+| Worker instruction | told → read | `tell A` writes to the worker's `notes/ORCHESTRATOR.md`, which every brief says to read before each step, and prints the call that resumes it |
+| Request | new work vs existing item | `task` refuses a request that names an existing item: a question goes to `status`, a change to `steer`; `--new` for separate work |
 | Run | working → waiting on the user → finished | `gate` exit codes 2, 3, 0. `finished` cannot be sent while the gate is open |
 | Orchestrator | none → recorded | `session` refuses to record a second one without `--replace` |
 
@@ -107,17 +110,22 @@ a worker report, an inbox line). The model sees only the skill text and the stat
 `space.py` commands, sees their output for up to three rounds, and the resulting files are checked
 by rule. No model grades anything.
 
-Claude Haiku 5.5, three trials per scenario, 2026-11-16:
+Three trials per scenario, 2026-11-16:
 
-| Skill version | Steward | Orchestrator | All |
-|---|---|---|---|
-| 0.1 (prose protocol, permissive script) | 36/45 | 20/36 | 56/81 (69 %) |
-| 0.2 (verbs, enforced lifecycle) | 43/45 | 32/36 | 75/81 (93 %) |
+| Skill version | DeepSeek V4.1 Flash `#low` | Claude Haiku 5.5 (before the last fixes) |
+|---|---|---|
+| 0.1 (prose protocol, permissive script) | 64/81 (79 %) | 56/81 (69 %) |
+| 0.2 (verbs, enforced lifecycle) | 81/81 (100 %) | 75/81 (93 %) |
 
-Read this as a development result, not a held-out one: version 0.2 was adjusted after an earlier
-run on these same scenarios. Three trials is also few; one scenario moved from 3/3 to 0/3 between
-two runs of the same skill. Details, the failures that remain and the reproduction command are in
-`evals/README.md`.
+Read this as a development result, not a held-out one. Each failure the models showed was fixed
+in the script or the prompt and then measured again on the same 27 scenarios, so 81/81 shows the
+known failures are gone, not that no failure remains. A finite eval cannot show that. Details,
+every fix and the reproduction commands are in `evals/README.md`.
+
+Decomposition (whole or parts, parallel or ordered) was measured with a train and a held-out set:
+held-out went from 4/12 to 27/30 over two runs, with the skill changed only from train failures.
+The questions the orchestrator now asks itself are in `orchestrator-prompt.md`, "Before you
+assign".
 
 ## State: JSON lines, not SQLite
 
@@ -137,9 +145,10 @@ The brainspace is a directory, by default `.steward/` in the project. Never `/tm
 ## Test
 
 ```sh
-python3 -m unittest discover -s skills/steward/tests -v   # the state machine, 58 tests
+python3 -m unittest discover -s skills/steward/tests -v   # the state machine, 73 tests
 python3 evals/run.py --selfcheck                          # the scenarios are solvable and non-trivial
 python3 evals/run.py --model claude-haiku-5-5 --repeats 3 # needs the `claude` CLI; about $0.30
+python3 evals/run.py --model 'opencode-go/deepseek-v4.1-flash#low' --versions v02 --repeats 1  # smoke, ~2 min
 ```
 
 The finish path and the escalation → approval → resume path of version 0.1 were smoke-tested end
@@ -149,7 +158,8 @@ OpenCode; its commands are tested by the unit tests and the eval only.
 ## Compliance
 
 - **Agent Skills:** `skills/steward/SKILL.md`; `name: steward` matches its directory; frontmatter
-  follows the required fields. `skills-ref validate skills/steward` passes.
+  follows the required fields. `uvx --from skills-ref agentskills validate skills/steward` prints
+  `Valid skill` (checked 2026-11-16).
 - **Agent Plugins 1.0.0:** root `plugin.json` with the canonical `$schema`, and skills under the
   fixed `skills/` location. No MCP servers, so no `mcp.json`. The manifest validates against the
   published 1.0.0 schema.

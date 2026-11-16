@@ -12,14 +12,16 @@ Conditions are whole skill versions: the prompt text and the script the commands
   python3 evals/run.py --selfcheck                      # scenarios are solvable and non-trivial
   python3 evals/run.py --model claude-haiku-5-5 --repeats 3
 
-Model calls go through `claude -p` with no tools and no settings.
+Model calls have no tools. A `provider/model` id (`opencode-go/deepseek-v4.1-flash`) goes through\n`opencode run`; any other id goes through `claude -p` with no settings.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import concurrent.futures as cf
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -29,7 +31,8 @@ from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROUNDS = 3  # the model sees its commands' output and may continue
+PARSE = "\0parse"  # marks a line the shell could not parse
+ROUNDS = 5  # the model sees its commands' output and may continue
 SKILL = HERE.parent / "skills" / "steward"
 VERSIONS = {
     "v01": {"script": HERE / "v01" / "space.py", "steward": HERE / "v01" / "SKILL.md",
@@ -67,7 +70,8 @@ def commands(reply: str) -> list[list[str]]:
             continue
         try:
             argv = shlex.split(line.split("space.py", 1)[1], comments=True)
-        except ValueError:
+        except ValueError as err:  # a real shell would fail too; show the model, as a shell would
+            out.append([PARSE, f"sh: {err}: {line.strip()[:200]}"])
             continue
         if argv[:1] == ["--dir"]:
             argv = argv[2:]
@@ -79,6 +83,9 @@ def commands(reply: str) -> list[list[str]]:
 def execute(script: Path, root: Path, cmds: list[list[str]], last: str = "") -> list[dict]:
     log = []
     for argv in cmds:
+        if argv[0] == PARSE:
+            log.append({"argv": ["(unparsed)"], "code": 2, "out": "", "err": argv[1], "last": last})
+            continue
         argv = [a.replace("$ID", last) for a in argv]
         proc = space(script, root, argv, root.parent)
         if argv[0] in {"add", "task"} and proc.returncode == 0:
@@ -104,6 +111,26 @@ def check(root: Path, before: dict, expect: dict) -> list[str]:
             miss.append(f"{item} owner {got.get('owner')!r} not {want['owner']!r}")
         if "evidence" in want and bool(str(got.get("evidence") or "").strip()) != want["evidence"]:
             miss.append(f"{item} evidence present={not want['evidence']}")
+    for whole, specs in expect.get("parts_of", {}).items():  # decomposition, matched by request text
+        parts = [r for r in ledger.values() if r.get("part_of") == whole]
+        if specs == "none":
+            if parts:
+                miss.append(f"{whole} was split into {len(parts)} parts; it needed none")
+            continue
+        for spec in specs:
+            hit = [p for p in parts if re.search(spec["re"], p["request"], re.I)]
+            if not hit:
+                miss.append(f"no part of {whole} matching /{spec['re']}/")
+                continue
+            p = hit[0]
+            if "state" in spec and p["state"] != spec["state"]:
+                miss.append(f"part /{spec['re']}/ is {p['state']}, not {spec['state']}")
+            deps = [ledger[a]["request"] for a in p.get("after", []) if a in ledger]
+            for dep in spec.get("after", []):
+                if not any(re.search(dep, d, re.I) for d in deps):
+                    miss.append(f"part /{spec['re']}/ does not wait for /{dep}/")
+            if spec.get("after") == [] and deps:
+                miss.append(f"part /{spec['re']}/ waits for {p['after']}; it is independent")
     if "item_count" in expect and len(ledger) != expect["item_count"]:
         miss.append(f"{len(ledger)} items, not {expect['item_count']}")
     for box in ("inbox", "outbox"):
@@ -138,14 +165,14 @@ def build(scn: dict, tmp: Path) -> tuple[Path, dict, str]:
     root = tmp / ".steward"
     new = VERSIONS["v02"]["script"]
     space(new, root, ["init", scn.get("goal", "Ship the project.")], tmp)
-    for line in scn.get("setup", []):
-        proc = space(new, root, shlex.split(line), tmp)
-        if proc.returncode not in (0, 2, 3):
-            raise RuntimeError(f"{scn['id']} setup failed: {line}: {proc.stderr}")
     for rel, text in scn.get("files", {}).items():
         path = tmp / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+    for line in scn.get("setup", []):
+        proc = space(new, root, shlex.split(line), tmp)
+        if proc.returncode not in (0, 2, 3):
+            raise RuntimeError(f"{scn['id']} setup failed: {line}: {proc.stderr}")
     before = {b: len(rows(root / f"{b.upper()}.jsonl")) for b in ("inbox", "outbox")}
     dump = f"$ cat GOAL.md\n{(root / 'GOAL.md').read_text().strip()}\n" + "\n".join(
         f"$ space.py {' '.join(a)}\n{space(new, root, a, tmp).stdout.strip() or '(nothing)'}"
@@ -154,10 +181,33 @@ def build(scn: dict, tmp: Path) -> tuple[Path, dict, str]:
     return root, before, dump
 
 
+OPENCODE = Path(tempfile.mkdtemp(prefix="steward-eval-"))  # holds the no-tool agents
+
+
+def agent(system: str) -> str:
+    """Name of a no-tool OpenCode agent whose prompt is `system`; written once before any call."""
+    name = "eval-" + hashlib.sha1(system.encode()).hexdigest()[:10]
+    path = OPENCODE / ".opencode" / "agents" / f"{name}.md"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('---\ndescription: eval responder\nmode: primary\npermission:\n  "*": deny\n---\n' + system)
+    return name
+
+
 def call(model: str, system: str, user: str) -> tuple[str, float]:
-    cmd = ["claude", "-p", "--model", model, "--system-prompt", system, "--tools", "",
-           "--setting-sources", "", "--strict-mcp-config", "--output-format", "json"]  # fmt: skip
+    """One reply, no tools. `provider/model` goes through OpenCode, anything else through Claude Code."""
+    if "/" in model:
+        cmd = ["opencode", "run", "--agent", agent(system), "--model", model, "--format", "json", "--archived", user]
+        env = {**os.environ, "PWD": str(OPENCODE)}  # opencode reads $PWD, not the process cwd
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=OPENCODE, env=env, timeout=240)
+        events = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+        text = "".join(e["part"].get("text", "") for e in events if e.get("type") == "text")
+        if not text:
+            raise RuntimeError(f"no reply: {proc.stdout[-300:]} {proc.stderr[-300:]}")
+        return text, sum(e["part"].get("cost", 0.0) for e in events if e.get("type") == "step_finish")
     with tempfile.TemporaryDirectory() as cwd:
+        cmd = ["claude", "-p", "--model", model, "--system-prompt", system, "--tools", "",
+               "--setting-sources", "", "--strict-mcp-config", "--output-format", "json"]  # fmt: skip
         proc = subprocess.run(cmd, input=user, capture_output=True, text=True, cwd=cwd, timeout=300)
     out = json.loads(proc.stdout)
     return out.get("result", ""), out.get("total_cost_usd", 0.0)
@@ -172,7 +222,10 @@ def trial(scn: dict, version: str, model: str) -> dict:
         log, replies, cost, last = [], [], 0.0, ""
         for _ in range(ROUNDS):
             try:
-                reply, spent = call(model, system, user)
+                try:
+                    reply, spent = call(model, system, user)
+                except (subprocess.TimeoutExpired, RuntimeError):  # one retry: a hung API call is not the model's fault
+                    reply, spent = call(model, system, user)
             except Exception as err:  # noqa: BLE001 - a failed call is a failed trial, not a crash
                 return {"id": scn["id"], "version": version, "role": scn["role"], "pass": False,
                         "miss": [f"call: {err}"], "cost": cost}  # fmt: skip
@@ -196,6 +249,8 @@ def selfcheck(scenarios: list[dict]) -> int:
     bad = 0
     for scn in scenarios:
         for version, key in (("v02", "solution"), ("v01", "solution_v01"), (None, None)):
+            if version == "v01" and "solution_v01" not in scn:  # uses verbs v01 does not have
+                continue
             with tempfile.TemporaryDirectory() as tmp:
                 root, before, _ = build(scn, Path(tmp))
                 if version:
@@ -204,7 +259,7 @@ def selfcheck(scenarios: list[dict]) -> int:
             if version and miss:
                 bad += 1
                 print(f"{scn['id']}: {key} does not pass: {miss}")
-            if not version and not miss:
+            if not version and not miss and not scn.get("passive"):
                 bad += 1
                 print(f"{scn['id']}: passes with no commands; it tests nothing")
     print(f"{len(scenarios)} scenarios, {bad} problems")
@@ -217,6 +272,7 @@ def main() -> int:
     ap.add_argument("--selfcheck", action="store_true")
     ap.add_argument("--model", default="claude-haiku-5-5")
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--versions", nargs="+", default=["v01", "v02"], choices=list(VERSIONS))
     ap.add_argument("--out", default=str(HERE / "results"))
     args = ap.parse_args()
@@ -224,12 +280,24 @@ def main() -> int:
     if args.selfcheck:
         return selfcheck(scenarios)
 
+    for v in args.versions:
+        for role in ("steward", "orchestrator"):
+            agent(VERSIONS[v][role].read_text() + INTERFACE)
     jobs = [(s, v) for s in scenarios for v in args.versions for _ in range(args.repeats)]
-    with cf.ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(lambda j: trial(j[0], j[1], args.model), jobs))
     out = Path(args.out)
     out.mkdir(exist_ok=True)
-    (out / f"{args.model}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in results))
+    path = out / f"{re.sub(r'[/:#]', '_', args.model)}.jsonl"
+    path.write_text("")
+    results = []
+    with cf.ThreadPoolExecutor(args.workers) as pool, path.open("a") as fh:
+        futures = [pool.submit(trial, s, v, args.model) for s, v in jobs]
+        for n, fut in enumerate(cf.as_completed(futures), 1):  # stream, so a slow run shows progress
+            r = fut.result()
+            results.append(r)
+            fh.write(json.dumps(r) + "\n")
+            fh.flush()
+            print(f"[{n}/{len(jobs)}] {r['version']} {r['id']}: {'pass' if r['pass'] else 'FAIL ' + '; '.join(r['miss'])[:160]}",
+                  flush=True)  # fmt: skip
 
     tally: dict = defaultdict(lambda: [0, 0])
     for r in results:

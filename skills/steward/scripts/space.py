@@ -18,6 +18,7 @@ Orchestrator verbs:
   space.py --dir DIR assign L3 A --goal "..." --done "..." [--known "..."]   # brief + owner
   space.py --dir DIR done L3 [--evidence "what you ran and saw"]   # runs the item's check if it has one
   space.py --dir DIR escalate L3 "one specific question"           # item blocked + report
+  space.py --dir DIR tell A "instruction"             # to a running worker; prints how to resume it
   space.py --dir DIR send outbox milestone|finished "text"
   space.py --dir DIR gate                             # 0 finished, 2 continue, 3 waiting on user
 
@@ -28,7 +29,8 @@ Both:
   space.py --dir DIR session [ID] [--agent A] [--replace]   # store or print a subagent session id
 
 Primitives (the verbs above are built from these):
-  add "request" [--owner A] [--check CMD] | set L3 [--state S] [--owner A] [--evidence E]
+  add "request" [--owner A] [--check CMD] [--part-of L1] [--after L2,L3]
+  set L3 [--state S] [--owner A] [--evidence E] [--after L2,L3]
   send inbox|outbox KIND "text" [--item L3] | agent A "brief" | agent A --stdin
 """
 
@@ -49,18 +51,21 @@ try:
 except ImportError:  # Windows: no lock; use WSL when the steward and orchestrator share a brainspace.
     fcntl = None
 
-STATES = ["open", "delegated", "done", "blocked-on-user", "cancelled"]
+STATES = ["open", "split", "delegated", "done", "blocked-on-user", "cancelled"]
 # The item lifecycle. Anything not listed is refused.
 TRANSITIONS = {
-    "open": {"delegated", "blocked-on-user", "cancelled", "done"},
+    "open": {"split", "delegated", "blocked-on-user", "cancelled", "done"},
+    "split": {"open", "blocked-on-user", "cancelled", "done"},  # waits on its parts
     "delegated": {"open", "blocked-on-user", "cancelled", "done"},
-    "blocked-on-user": {"open", "delegated", "cancelled"},
+    "blocked-on-user": {"open", "split", "delegated", "cancelled"},
     "done": {"open", "delegated"},  # reopened by a steer
     "cancelled": {"open"},
 }
 FINAL = {"done", "cancelled"}
 MAY_END = FINAL | {"blocked-on-user"}
 INBOX_KINDS = ["task", "steer", "cancel", "note"]
+DESTRUCTIVE = re.compile(r"\b(delete|remove|rm|clean(?: out| up)?|wipe|purge|drop|truncate|overwrite|reset|"
+                         r"get rid of|prune|erase|force[- ]push)\b", re.IGNORECASE)
 OUTBOX_KINDS = ["escalate", "milestone", "finished"]
 LETTER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 STAMP = "%Y-%m-%dT%H:%M:%S"
@@ -154,10 +159,29 @@ def move(row: dict, state: str | None = None, owner: str | None = None,
     row["state"], row["owner"], row["updated"] = new, who, now()
 
 
-def restore(row: dict) -> None:
+def restore(row: dict, rows: list[dict]) -> None:
     """Put a blocked or finished item back to work."""
-    if row["state"] in {"blocked-on-user", "done"}:
+    if row["state"] == "blocked-on-user" and parts_of(rows, row["id"]):
+        move(row, "split")
+    elif row["state"] in {"blocked-on-user", "done"}:
         move(row, "delegated" if row.get("owner") else "open")
+
+
+def parts_of(rows: list[dict], item: str) -> list[dict]:
+    return [r for r in rows if r.get("part_of") == item]
+
+
+def waits_for(rows: list[dict], row: dict) -> list[str]:
+    """The `--after` items that are not done yet."""
+    return [a for a in row.get("after", []) if find(rows, a)["state"] != "done"]
+
+
+def show(r: dict, rows: list[dict] | None = None) -> str:
+    """One item; with `rows`, each dependency's request is named so a wrong id reads as wrong."""
+    names = {x["id"]: x["request"] for x in rows or []}
+    deps = ", ".join(f"{a} ({names[a][:40]})" if a in names else a for a in r.get("after", []))
+    extra = (f" part of {r['part_of']}" if r.get("part_of") else "") + (f" after {deps}" if deps else "")
+    return f"{r['id']} [{r['state']}] owner={r['owner'] or '-'}{extra}: {r['request']}"
 
 
 def post(root: Path, box: str, kind: str, text: str, item: str = "") -> str:
@@ -190,7 +214,8 @@ def brief_text(root: Path, row: dict, letter: str, goal: str, done: str, known: 
         f"4. **Your directory.** `{home}/`. Notes go in `notes/`, results in `out/`. Write nothing\n"
         f"   outside it unless the goal names the file.\n"
         f"5. **Survive.** After each step, append one line to `{home}/STATUS.md`: what is done,\n"
-        f"   where it is, what is next. You may be stopped without warning.\n"
+        f"   where it is, what is next. You may be stopped without warning. Before each step, read\n"
+        f"   `{home}/notes/ORCHESTRATOR.md` if it exists: its lines override this brief.\n"
         f"6. **Report.** Under 200 words: what you did, the output of the done command, exact\n"
         f"   paths, anything you could not determine. Do not ask questions; do not launch agents.\n"
     )
@@ -213,10 +238,18 @@ def session_of(root: Path, letter: str) -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def advice(root: Path, r: dict) -> str:
+def advice(root: Path, r: dict, rows: list[dict]) -> str:
     """What the orchestrator should do about an unfinished item."""
+    if r["state"] == "split":
+        left = [f"{p['id']} [{p['state']}]" for p in parts_of(rows, r["id"]) if p["state"] not in FINAL]
+        return f"waits on its parts {', '.join(left)}" if left else f"every part is closed: `done {r['id']}`"
+    blocked = waits_for(rows, r)
+    if r["state"] == "open" and blocked:
+        return f"waits for {', '.join(blocked)}; assign it once that is done, and run other open items now"
     if r["state"] == "open":
-        return f"assign it: `assign {r['id']} <letter> --goal ... --done ...`, then start the worker"
+        return (f"can one worker finish all of it and prove it with one done command? Then "
+                f"`assign {r['id']} <letter> --goal ... --done ...` and start the worker. If not, split it: "
+                f"`add '<part>' --part-of {r['id']}` per part")  # fmt: skip
     owner = r.get("owner") or ""
     if not (root / "agents" / owner / "BRIEF.md").exists():
         return f"{owner} has no brief: `assign {r['id']} {owner} --goal ... --done ...`"
@@ -242,8 +275,8 @@ def gate(root: Path, quiet: bool = False) -> int:
     ]  # fmt: skip
 
     for r in active:
-        say(f"NOT DONE {r['id']} [{r['state']}] owner={r['owner'] or '-'}: {r['request']}")
-        say(f"  -> {advice(root, r)}")
+        say(f"NOT DONE {show(r, rows)}")
+        say(f"  -> {advice(root, r, rows)}")
     for m in unread:
         say(f"UNREAD {m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m.get('text', '')}")
         say(f"  -> handle it, then `ack inbox {m['id']}`")
@@ -281,9 +314,10 @@ def cmd_init(root: Path, goal: str | None) -> int:
 
 
 def cmd_list(root: Path, open_only: bool) -> int:
-    for r in load(root / "LEDGER.jsonl"):
+    rows = load(root / "LEDGER.jsonl")
+    for r in rows:
         if not open_only or r["state"] not in FINAL:
-            print(f"{r['id']} [{r['state']}] owner={r['owner'] or '-'}: {r['request']}")
+            print(show(r, rows))
     return 0
 
 
@@ -302,10 +336,10 @@ def cmd_status(root: Path, stale: int) -> int:
         if r["state"] == "done":
             print(f"    evidence: {str(r.get('evidence') or 'NONE')[:160]}")
         status = root / "agents" / (r.get("owner") or "-") / "STATUS.md"
-        if r["state"] in FINAL or not r.get("owner") or not status.exists():
+        if r["state"] in FINAL or not r.get("owner"):
             continue
-        lines = [ln for ln in status.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        quiet = minutes_since(status.stat().st_mtime)
+        lines = [ln for ln in status.read_text(encoding="utf-8").splitlines() if ln.strip()] if status.exists() else []
+        quiet = minutes_since(status.stat().st_mtime) if status.exists() else age
         flag = f"  STALE: silent {quiet}m" if r["state"] == "delegated" and quiet >= stale else ""
         print(f"    {r['owner']}: {lines[-1][:160] if lines else '(no status line yet)'}{flag}")
     for box in ("inbox", "outbox"):
@@ -318,8 +352,17 @@ def cmd_status(root: Path, stale: int) -> int:
 
 def cmd_done(root: Path, args: argparse.Namespace) -> int:
     """Close an item. If it carries a check, the check decides, not the caller."""
-    row = find(load(root / "LEDGER.jsonl"), args.id)
+    rows = load(root / "LEDGER.jsonl")
+    row = find(rows, args.id)
     evidence = (args.evidence or "").strip()
+    parts = parts_of(rows, args.id)
+    left = [p["id"] for p in parts if p["state"] not in FINAL]
+    if left:
+        raise Refused(f"{args.id} waits on its parts {', '.join(left)}; close them first")
+    if parts and not any(p["state"] == "done" for p in parts):
+        raise Refused(f"every part of {args.id} was cancelled; cancel or steer {args.id} instead")
+    if parts and not row.get("check") and not evidence:
+        evidence = "parts done: " + ", ".join(p["id"] for p in parts if p["state"] == "done")
     if row.get("check"):
         try:
             proc = subprocess.run(row["check"], shell=True, capture_output=True, text=True,
@@ -341,6 +384,10 @@ def cmd_done(root: Path, args: argparse.Namespace) -> int:
     left = gate(root, quiet=True)
     after = {0: 'every item is closed: `send outbox finished "<summary with evidence paths>"`',
              2: "work remains: run `gate`", 3: "the rest waits on the user: end with `waiting on user`"}  # fmt: skip
+    whole = row.get("part_of")
+    if whole and left == 2 and not [p for p in parts_of(load(root / "LEDGER.jsonl"), whole) if p["state"] not in FINAL]:
+        print(f"{args.id} done; every part of {whole} is closed: `done {whole}`")
+        return 0
     print(f"{args.id} done; {after[left]}")
     return 0
 
@@ -356,18 +403,52 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
             raise Refused(f"{cmd} needs a request")
         if args.owner:
             check_letter(args.owner)
+        whole = find(rows, args.part_of) if cmd == "add" and args.part_of else None
+        if whole is not None and whole["state"] not in ("open", "split"):
+            raise Refused(f"{whole['id']} is {whole['state']}; only open work is split into parts")
+        twin = [r["id"] for r in rows if r.get("part_of") == (whole or {}).get("id")
+                and r["request"].strip().lower() == args.request.strip().lower() and r["state"] != "cancelled"]
+        if whole is not None and twin:
+            raise Refused(f"{twin[0]} already is this part of {whole['id']}; nothing added")
+        after = [a.strip() for a in (getattr(args, "after", "") or "").split(",") if a.strip()]
+        for a in after:
+            find(rows, a)
+        named = [r["id"] for r in rows if re.search(rf"\b{r['id']}\b", args.request)]
+        if cmd == "task" and named and not args.new:
+            raise Refused(f"this names {named[0]}, which already exists. A question about it: answer "
+                          f"from `status`. A change to it: `steer {named[0]} \"...\"`. Separate new work: "
+                          "add --new")  # fmt: skip
         row = {"id": next_id(rows), "request": args.request, "owner": args.owner,
                "state": "open", "evidence": "", "updated": now()}  # fmt: skip
         if args.check:
             row["check"] = args.check
+        if whole is not None:
+            row["part_of"] = whole["id"]
+            if whole["state"] == "open":
+                move(whole, "split")
+        if after:
+            row["after"] = after
         save(ledger, [*rows, row])
         if cmd == "task":
             post(root, "inbox", "task", args.request, row["id"])
         print(row["id"])
+        if cmd == "add" and whole is None:
+            print(f"{row['id']} is a separate item, not a part. One part of an item takes --part-of",
+                  file=sys.stderr)  # fmt: skip
     elif cmd == "set":
         row = find(rows, args.id)
         if args.state == "done" and row.get("check"):
             raise Refused(f"{args.id} has a check; use `done {args.id}` so the check decides")
+        if args.after is not None:  # order found late: a waiting part cannot already be running
+            after = [a.strip() for a in args.after.split(",") if a.strip()]
+            for a in after:
+                if a == args.id:
+                    raise Refused(f"{args.id} cannot wait for itself")
+                find(rows, a)
+            if after and row["state"] == "delegated" and [a for a in after if find(rows, a)["state"] != "done"]:
+                raise Refused(f"{args.id} is already with {row['owner']}; `tell {row['owner']}` to stop, "
+                              f"`set {args.id} --state open`, then add --after")  # fmt: skip
+            row["after"] = after
         move(row, args.state, args.owner, args.evidence)
         save(ledger, rows)
     elif cmd == "steer":
@@ -375,12 +456,17 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         if row["state"] == "cancelled":
             raise Refused(f"{args.id} is cancelled; send a new `task` instead")
         answered = row["state"] == "blocked-on-user"
-        restore(row)
+        restore(row, rows)
         save(ledger, rows)
         mid = post(root, "inbox", "steer", args.text, args.id)
         if answered:  # a decision outlives the item that asked for it
             with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
                 fh.write(f"\n- Decision ({now()[:10]}, {args.id}): {args.text.strip()}\n")
+            outbox = load(root / "OUTBOX.jsonl")
+            for m in outbox:  # the question is answered, so its line is handled
+                if m.get("kind") == "escalate" and m.get("item") == args.id:
+                    m["read"] = True
+            save(root / "OUTBOX.jsonl", outbox)
         print(mid)
     elif cmd == "cancel":
         row = find(rows, args.id)
@@ -389,8 +475,13 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         if row["state"] == "cancelled":
             raise Refused(f"{args.id} is already cancelled")
         move(row, "cancelled")
+        dropped = [p for p in parts_of(rows, args.id) if p["state"] not in FINAL]
+        for p in dropped:
+            move(p, "cancelled")
         save(ledger, rows)
         print(post(root, "inbox", "cancel", args.text, args.id))
+        for p in dropped:
+            print(post(root, "inbox", "cancel", f"part of {args.id}: {args.text}", p["id"]))
     elif cmd == "note":
         mid = post(root, "inbox", "note", args.text)
         with (root / "GOAL.md").open("a", encoding="utf-8") as fh:
@@ -410,6 +501,12 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
             raise Refused(f"{args.id} belongs to {row['owner']}; steer that worker, or `set {args.id} --state open` first")
         if row["state"] == "blocked-on-user":
             raise Refused(f"{args.id} waits on the user; only the steward's `steer` puts it back in work")
+        if row["state"] == "split":
+            parts = ", ".join(p["id"] for p in parts_of(rows, args.id))
+            raise Refused(f"{args.id} is split into {parts}; assign those, then `done {args.id}` when they close")
+        blocked = waits_for(rows, row)
+        if blocked:
+            raise Refused(f"{args.id} needs {', '.join(blocked)} done first; assign the other open items now")
         if row["state"] in FINAL:
             raise Refused(f"{args.id} is {row['state']}; only the steward's `steer` or a new `task` reopens work")
         busy = [r["id"] for r in rows
@@ -418,6 +515,11 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
             raise Refused(f"{args.letter} already owns {busy[0]}; one worker, one item: pick another letter")
         if not args.goal.strip() or not args.done.strip():
             raise Refused("assign needs --goal and --done")
+        risky = DESTRUCTIVE.search(f"{row['request']} {args.goal}")
+        if risky and not (args.confirmed or "").strip():
+            raise Refused(f"{args.id} deletes or overwrites ('{risky.group(0)}'). If the request or a decision "
+                          "in GOAL.md names exactly what goes, quote it: --confirmed '<those words>'. If it "
+                          f"has two readings, `escalate {args.id} '<which reading?>'` instead")  # fmt: skip
         move(row, "delegated", args.letter)
         home = write_agent(root, args.letter, brief_text(root, row, args.letter, args.goal, args.done, args.known))
         save(ledger, rows)
@@ -429,6 +531,11 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         box = ids.pop(0) if ids[0] in ("inbox", "outbox") else ""
         if not ids:
             raise Refused("ack needs a message id, e.g. `ack O1`")
+        blocked = {r["id"] for r in rows if r["state"] == "blocked-on-user"}
+        for m in load(root / "OUTBOX.jsonl"):
+            if m["id"] in ids and m.get("kind") == "escalate" and m.get("item") in blocked:
+                raise Refused(f"{m['id']} is the open question on {m['item']}; leave it. The `steer "
+                              f"{m['item']} ...` that answers it acks it")  # fmt: skip
         acked = 0
         for name in ("inbox", "outbox"):  # an id names its own mailbox: I1 or O1
             wanted = {i for i in ids if i[:1].upper() == name[0].upper()}
@@ -455,6 +562,26 @@ def mutate(root: Path, args: argparse.Namespace) -> None:
         if args.stdin and args.brief is not None:
             raise Refused("agent takes a brief or --stdin, not both")
         print(write_agent(root, args.letter, sys.stdin.read() if args.stdin else (args.brief or "")))
+    elif cmd == "tell":
+        check_letter(args.letter, "agent letter")
+        owned = [r["id"] for r in rows if r["owner"] == args.letter and r["state"] == "delegated"]
+        if not owned:
+            raise Refused(f"{args.letter} owns no delegated item; put the instruction in the brief "
+                          "when you assign the item")  # fmt: skip
+        if not args.text.strip():
+            raise Refused("tell needs text")
+        home = root / "agents" / args.letter
+        (home / "notes").mkdir(parents=True, exist_ok=True)
+        with (home / "notes" / "ORCHESTRATOR.md").open("a", encoding="utf-8") as fh:
+            fh.write(f"- {now()} {args.text.strip()}\n")
+        sid = session_of(root, args.letter)
+        if sid:
+            print(f"recorded for {args.letter} ({', '.join(owned)}). If it has stopped, resume it: "
+                  f'subagent({{ agent: "steward-worker", sessionID: "{sid}", description: "{args.letter}: '
+                  f'new instruction", prompt: "Read notes/ORCHESTRATOR.md and continue." }}). '
+                  "If it is still running, it reads the file before its next step.")  # fmt: skip
+        else:
+            print(f"recorded for {args.letter} ({', '.join(owned)}); it reads the file before its next step")
     elif cmd == "session":
         if args.agent is not None:
             check_letter(args.agent, "agent letter")
@@ -503,11 +630,16 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("request")
         p.add_argument("--owner", default="")
         p.add_argument("--check", default="")
+        p.add_argument("--new", action="store_true", help="the request names an item but is separate work")
+        if name == "add":
+            p.add_argument("--part-of", default="", help="the item this is one part of")
+            p.add_argument("--after", default="", help="items that must be done first, e.g. L2,L3")
     p = sub.add_parser("set")
     p.add_argument("id")
     p.add_argument("--state", choices=STATES)
     p.add_argument("--owner")
     p.add_argument("--evidence")
+    p.add_argument("--after", help="items that must be done first, e.g. L2,L3 (empty clears)")
     for name in ("steer", "cancel", "escalate"):
         p = sub.add_parser(name)
         p.add_argument("id")
@@ -519,6 +651,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--goal", default="")
     p.add_argument("--done", default="")
     p.add_argument("--known", default="")
+    p.add_argument("--confirmed", default="", help="the words that name exactly what a destructive goal removes")
     p = sub.add_parser("done")
     p.add_argument("id")
     p.add_argument("--evidence")
@@ -537,6 +670,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("letter")
     p.add_argument("brief", nargs="?", default=None)
     p.add_argument("--stdin", action="store_true")
+    p = sub.add_parser("tell")
+    p.add_argument("letter")
+    p.add_argument("text")
+    sub.add_parser("help").add_argument("command", nargs="?")
     p = sub.add_parser("session")
     p.add_argument("id", nargs="?", default=None)
     p.add_argument("--agent", default=None)
@@ -546,7 +683,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = parser().parse_args()
+    ap = parser()
+    args = ap.parse_args()
+    if args.cmd == "help":
+        if args.command:
+            ap.parse_args(["--dir", args.dir, args.command, "--help"])  # prints that command's help, exits 0
+        ap.print_help()
+        return 0
     root = Path(args.dir)
     if args.cmd == "init":
         return cmd_init(root, args.goal)

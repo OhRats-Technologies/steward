@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Python 3.10+ and OpenCode 2.x with subagents; the included agent adapter is OpenCode-specific.
 metadata:
   author: OhRats Technologies
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Steward
@@ -42,6 +42,8 @@ its error and follow it; do not edit the JSON files by hand.
     open | delegated -> blocked-on-user  (escalate)  -> back to work on your steer
     open | delegated | blocked -> cancelled
     done -> open | delegated             (a steer reopens it and clears the old evidence)
+    open -> split -> done                the orchestrator split it into parts (`--part-of`); it
+                                         closes after every part; cancelling it cancels them
 
 `read` prints unacked lines and does not consume them. Act, then `ack <id>` (`ack O1`). The gate stays
 closed on unacked inbox lines. The orchestrator acks `INBOX.jsonl`; you ack `OUTBOX.jsonl`. Never
@@ -100,7 +102,7 @@ each idle produces a report in this session. That report is your wake.
 | Answer to an escalation | `steer <id> "<the answer>"` |
 | Cancellation | `cancel <id> "<why>"` |
 | Standing preference | `note "<the rule>"` (it lands in `GOAL.md` and in every later brief). Only for a rule that binds all work; an instruction or answer about one item is a `steer`, never also a `note` |
-| Question or status check | `status`, then answer from what it prints. Send nothing. If the answer is not there, say so and route a lookup `task` |
+| Question or status check | `status`, then answer from what it prints. Send nothing, add nothing. A question about an item is answered by its line and its worker's last status line, even when that is "no status line yet". A lookup `task` only for a fact about the project that no item records |
 
 Each verb changes the ledger and writes the directive in one step. `steer` puts a blocked or
 finished item back to work by itself; you never set states by hand.
@@ -117,9 +119,10 @@ turn. Without it, a directive sits unread in a finished or waiting session.
 **A report from the orchestrator.** Read the outbox, handle it, ack it.
 
 - `escalate`: if `GOAL.md` already answers the question, do not ask the user: `steer <id>
-  "<decision>"` (it records the decision in `GOAL.md`), wake the orchestrator, `ack O<n>`. If the answer is the
-  user's, ask one specific question, leave the item blocked, and do not wake the orchestrator for
-  that item; other work keeps moving. When the answer arrives, `steer` and wake.
+  "<decision>"` (it records the decision in `GOAL.md` and acks the question), then wake the
+  orchestrator. If the answer is the user's, ask one specific question, leave the item blocked and
+  the line unacked (`ack` refuses it), and do not wake the orchestrator for that item; other work
+  keeps moving. When the answer arrives, `steer` and wake.
 - `finished`: run `space.py gate`. Exit 0 plus the goal's own done command is the only reason to
   tell the user it is done. Exit 3 means a user decision is still pending; handle it. Exit 2 means
   work remains. If the gate is 0 but the done command fails, add a task for the gap, wake the

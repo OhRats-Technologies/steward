@@ -460,7 +460,7 @@ class SpaceTest(unittest.TestCase):
         self.init()
         self.space("add", "x")
         self.space("task", "y")
-        self.space("escalate", "L1", "which?")
+        self.space("send", "outbox", "milestone", "half done")
         self.assertEqual(self.space("ack", "I1", "O1").stdout.strip(), "acked 2")
         proc = self.space("ack", "inbox", "O1", ok=False)
         self.assertIn("not an inbox id", proc.stderr)
@@ -517,7 +517,7 @@ class SpaceTest(unittest.TestCase):
     def test_gate_says_what_to_do_next(self) -> None:
         self.init()
         self.space("add", "x")
-        self.assertIn("assign it", self.space("gate", ok=False).stdout)
+        self.assertIn("`assign L1 <letter>", self.space("gate", ok=False).stdout)
         self.space("assign", "L1", "A", "--goal", "g", "--done", "d")
         self.assertIn("no session", self.space("gate", ok=False).stdout)
         self.space("session", "ses_a", "--agent", "A")
@@ -550,6 +550,140 @@ class SpaceTest(unittest.TestCase):
         self.assertEqual(sorted(ids, key=lambda item: int(item[1:])), [f"L{i}" for i in range(1, 11)])
         self.assertEqual(len(self.rows("LEDGER.jsonl")), 10)
 
+
+    # tell, help, task guard, status ---------------------------------------
+
+    def delegated(self) -> None:
+        self.init()
+        self.space("task", "write the parser")
+        self.space("assign", "L1", "A", "--goal", "write parser.py", "--done", "test -f parser.py")
+
+    def test_tell_records_the_instruction_and_prints_the_resume_call(self) -> None:
+        self.delegated()
+        self.space("session", "ses_a", "--agent", "A")
+        out = self.space("tell", "A", "use recursive descent").stdout
+        self.assertIn('sessionID: "ses_a"', out)
+        notes = (self.dir / "agents" / "A" / "notes" / "ORCHESTRATOR.md").read_text()
+        self.assertIn("use recursive descent", notes)
+        self.assertIn("notes/ORCHESTRATOR.md", (self.dir / "agents" / "A" / "BRIEF.md").read_text())
+
+    def test_tell_refuses_a_worker_with_no_delegated_item(self) -> None:
+        self.init()
+        proc = self.space("tell", "B", "hello", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("owns no delegated item", proc.stderr)
+
+    def test_help_exits_zero(self) -> None:
+        self.init()
+        self.assertIn("tell A", self.space("help").stdout)
+
+    def test_task_naming_an_existing_item_is_refused(self) -> None:
+        self.delegated()
+        proc = self.space("task", "report progress on L1", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("answer from `status`", proc.stderr)
+        self.assertEqual(len(self.rows("LEDGER.jsonl")), 1)
+        self.space("task", "benchmark the L1 parser", "--new")
+        self.assertEqual(len(self.rows("LEDGER.jsonl")), 2)
+
+    def test_status_shows_a_worker_with_no_status_file(self) -> None:
+        self.delegated()
+        (self.dir / "agents" / "A" / "STATUS.md").unlink()
+        self.assertIn("A: (no status line yet)", self.space("status").stdout)
+
+    def test_an_open_escalation_cannot_be_acked_and_the_answer_acks_it(self) -> None:
+        self.init()
+        self.space("add", "x")
+        self.space("escalate", "L1", "which?")
+        proc = self.space("ack", "O1", ok=False)
+        self.assertIn("open question on L1", proc.stderr)
+        self.space("steer", "L1", "the first")
+        self.assertTrue(self.rows("OUTBOX.jsonl")[0]["read"])
+
+    def test_destructive_assign_needs_the_words_that_confirm_it(self) -> None:
+        self.init()
+        self.space("task", "clean out build/, get rid of the old stuff")
+        proc = self.space("assign", "L1", "A", "--goal", "empty build/", "--done", "ls build", ok=False)
+        self.assertIn("escalate L1", proc.stderr)
+        self.space("assign", "L1", "A", "--goal", "empty build/", "--done", "ls build",
+                   "--confirmed", "user: delete everything in build/")
+        self.assertEqual(self.rows("LEDGER.jsonl")[0]["state"], "delegated")
+
+    # parts and order ------------------------------------------------------
+
+    def test_a_part_splits_its_item_and_the_item_cannot_be_assigned(self) -> None:
+        self.init()
+        self.space("task", "add --json and document it")
+        self.space("add", "add the --json flag", "--part-of", "L1")
+        self.space("add", "document --json in README", "--part-of", "L1")
+        self.assertEqual(self.state("L1"), "split")
+        proc = self.space("assign", "L1", "A", "--goal", "g", "--done", "d", ok=False)
+        self.assertIn("split into L2, L3", proc.stderr)
+        self.assertIn("waits on its parts L2 [open], L3 [open]", self.space("gate", ok=False).stdout)
+
+    def test_the_whole_closes_only_after_its_parts(self) -> None:
+        self.init()
+        self.space("task", "two parts")
+        self.space("add", "a", "--part-of", "L1")
+        self.space("add", "b", "--part-of", "L1")
+        proc = self.space("done", "L1", ok=False)
+        self.assertIn("waits on its parts L2, L3", proc.stderr)
+        self.space("done", "L2", "--evidence", "ran a")
+        out = self.space("done", "L3", "--evidence", "ran b").stdout
+        self.assertIn("every part of L1 is closed: `done L1`", out)
+        self.space("ack", "I1")
+        self.assertIn("every item is closed", self.space("done", "L1").stdout)
+
+    def test_a_part_with_after_waits_for_its_dependency(self) -> None:
+        self.init()
+        self.space("task", "parser then benchmark")
+        self.space("add", "write the parser", "--part-of", "L1")
+        self.space("add", "benchmark the parser", "--part-of", "L1", "--after", "L2")
+        proc = self.space("assign", "L3", "B", "--goal", "g", "--done", "d", ok=False)
+        self.assertIn("needs L2 done first", proc.stderr)
+        self.assertIn("L3 [open] owner=- part of L1 after L2 (write the parser)", self.space("gate", ok=False).stdout)
+        self.space("assign", "L2", "A", "--goal", "g", "--done", "d")
+        self.space("done", "L2", "--evidence", "ok")
+        self.space("assign", "L3", "B", "--goal", "g", "--done", "d")
+
+    def test_cancelling_the_whole_cancels_its_open_parts(self) -> None:
+        self.init()
+        self.space("task", "two parts")
+        self.space("add", "a", "--part-of", "L1")
+        self.space("add", "b", "--part-of", "L1")
+        self.space("done", "L2", "--evidence", "ok")
+        self.space("cancel", "L1", "not needed")
+        self.assertEqual([self.state(i) for i in ("L1", "L2", "L3")], ["cancelled", "done", "cancelled"])
+        self.assertEqual([m["item"] for m in self.rows("INBOX.jsonl") if m["kind"] == "cancel"], ["L1", "L3"])
+
+    def test_only_open_work_is_split(self) -> None:
+        self.delegated()
+        proc = self.space("add", "x", "--part-of", "L1", ok=False)
+        self.assertIn("only open work is split", proc.stderr)
+
+    def test_an_order_found_late_is_set_and_a_running_part_is_refused(self) -> None:
+        self.init()
+        self.space("task", "two then one")
+        self.space("add", "a", "--part-of", "L1")
+        self.space("add", "b", "--part-of", "L1")
+        self.space("set", "L3", "--after", "L2")
+        self.assertIn("needs L2 done first", self.space("assign", "L3", "B", "--goal", "g", "--done", "d", ok=False).stderr)
+        self.space("set", "L3", "--after", "")
+        self.space("assign", "L3", "B", "--goal", "g", "--done", "d")
+        proc = self.space("set", "L3", "--after", "L2", ok=False)
+        self.assertIn("already with B", proc.stderr)
+
+    def test_help_for_one_command(self) -> None:
+        self.init()
+        self.assertIn("--part-of", self.space("help", "add").stdout)
+
+    def test_a_repeated_part_is_not_added_twice(self) -> None:
+        self.init()
+        self.space("task", "x")
+        self.space("add", "write the parser", "--part-of", "L1")
+        proc = self.space("add", "Write the parser", "--part-of", "L1", ok=False)
+        self.assertIn("L2 already is this part", proc.stderr)
+        self.assertEqual(len(self.rows("LEDGER.jsonl")), 2)
 
 if __name__ == "__main__":
     unittest.main()
