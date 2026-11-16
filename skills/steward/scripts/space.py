@@ -109,7 +109,7 @@ def gate(root: Path, quiet: bool = False) -> int:
     for r in active:
         say(f"NOT DONE {r['id']} [{r['state']}] owner={r['owner'] or '-'}: {r['request']}")
     for m in unread:
-        say(f"UNREAD {m['id']} [{m.get('kind', '?')}]: {m['text']} (ack inbox {m['id']} after handling)")
+        say(f"UNREAD {m['id']} [{m.get('kind', '?')}]: {m.get('text', '')} (ack inbox {m['id']} after handling)")
     for r in unproven:
         say(f"NO EVIDENCE {r['id']}: marked done without a check you ran")
 
@@ -236,7 +236,7 @@ def main() -> int:
             if not args.text.strip():
                 print("send needs text", file=sys.stderr)
                 return 1
-            if args.box == "inbox" and args.kind in {"steer", "cancel"} and not args.item:
+            if args.box == "inbox" and args.kind != "note" and not args.item:
                 print(f"{args.kind} needs --item", file=sys.stderr)
                 return 1
             if args.box == "outbox" and args.kind == "escalate" and not args.item:
@@ -267,7 +267,7 @@ def main() -> int:
             path = root / f"{args.box.upper()}.jsonl"
             for m in load(path):
                 if not m.get("read"):
-                    print(f"{m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m['text']}")
+                    print(f"{m['id']} [{m.get('kind', '?')}] item={m.get('item') or '-'}: {m.get('text', '')}")
         elif args.cmd == "ack":
             path = root / f"{args.box.upper()}.jsonl"
             rows = load(path)

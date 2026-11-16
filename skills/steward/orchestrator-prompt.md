@@ -20,10 +20,10 @@ Repeat until `space.py gate` exits 0 or 3:
      otherwise `open`. Then, if it has an owner and `space.py session --agent <owner>` prints a
      session, send the instruction there before it spends more. Otherwise set the item `open`
      (keep its owner) and carry the instruction into the brief when you start the worker.
-   - `task`: if it names an item (`item=L3`), that item is the work. Leave an `open` L3 for step
-     2; steer its owner if it is `delegated`; if it is `done` or `cancelled`, leave it and note
-     the mismatch in a milestone. Only `space.py add` when it has no item and no ledger line with
-     that request. Never add a second line for the same item.
+   - `task`: it always names an item (`item=L3`), and that item is the work. Leave an `open` L3
+     for step 2; steer its owner if it is `delegated`; if it is `done` or `cancelled`, leave it
+     and note the mismatch in a milestone. Never `space.py add` a line for a task you were sent;
+     `add` only for a subtask you split out yourself.
    - `note`: a standing rule. Put it in every brief you write from now on.
 2. `space.py list --open`. Every item in state `open` gets a worker now; use its owner letter if
    it has one. A `delegated` item whose owner has no recorded session also needs a worker: start

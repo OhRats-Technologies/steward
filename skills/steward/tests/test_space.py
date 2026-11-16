@@ -149,7 +149,7 @@ class SpaceTest(unittest.TestCase):
 
     def test_send_targeted_kinds_need_an_item(self) -> None:
         self.init()
-        for box, kind in (("inbox", "steer"), ("inbox", "cancel")):
+        for box, kind in (("inbox", "task"), ("inbox", "steer"), ("inbox", "cancel")):
             with self.subTest(kind=kind):
                 proc = self.space("send", box, kind, "go", ok=False)
                 self.assertEqual(proc.returncode, 1)
