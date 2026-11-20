@@ -1,6 +1,18 @@
-# Steward
+<p align="center">
+  <img src="assets/header.svg" alt="Steward" width="100%" />
+</p>
 
-Steward is an Agent Skill for running longer tasks across three model tiers, so you can keep a strong model in charge without paying frontier prices for the whole run.
+<p align="center">
+  <em>A three-tier Agent Skill: keep a frontier model in charge without paying frontier prices for the whole run.</em>
+</p>
+
+<p align="center">
+  <a href="#setup-opencode-2x">Setup</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="skills/steward/SKILL.md">Skill</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="evals/README.md">Evals</a>
+</p>
 
 - **Steward** (frontier model) — talks to you, turns your requests into tasks, and wakes up when a decision is needed or the work is done.
 - **Orchestrator** (mid-tier subagent) — breaks tasks down, assigns them to workers, and checks their results.
