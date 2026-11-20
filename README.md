@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/header.png" alt="Steward" width="100%" />
+  <img src="assets/header.svg" alt="Steward" width="100%" />
 </p>
 
 <p align="center">
@@ -10,7 +10,6 @@
   <a href="#getting-started">Getting Started</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="skills/steward/SKILL.md">Skill</a> ·
-  <a href="ARCHITECTURE.md">Architecture</a> ·
   <a href="evals/README.md">Evals</a>
 </p>
 
@@ -37,7 +36,6 @@ The steward creates `.steward/`, starts the orchestrator in the background, and 
 ## More Info
 
 - **Skill prompts:** [`skills/steward/SKILL.md`](skills/steward/SKILL.md) and [`skills/steward/orchestrator-prompt.md`](skills/steward/orchestrator-prompt.md)
-- **Design notes:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - **Evals:** [`evals/README.md`](evals/README.md)
 
 Run the tests locally:

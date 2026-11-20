@@ -5,21 +5,18 @@ Each scenario builds a brainspace, shows the model its state and one event (a us
 steward, a report or an inbox line for the orchestrator), runs the `space.py` commands the model
 replies with, and checks the resulting files by rule. No model grades anything.
 
-Conditions are whole skill versions: the prompt text and the script the commands run against.
-  v01  the first release: prose protocol, permissive script (evals/v01/)
-  v02  the current skill: verbs and an enforced lifecycle (skills/steward/)
-
   python3 evals/run.py --selfcheck                      # scenarios are solvable and non-trivial
   python3 evals/run.py --model claude-haiku-5-5 --repeats 3
 
-Model calls have no tools. A `provider/model` id (`opencode-go/deepseek-v4.1-flash`) goes through\n`opencode run`; any other id goes through `claude -p` with no settings.
+Model calls have no tools. A `provider/model` id (`opencode-go/deepseek-v4.1-flash`) goes through
+`opencode run`; any other id goes through `claude -p` with no settings.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
@@ -34,12 +31,11 @@ HERE = Path(__file__).resolve().parent
 PARSE = "\0parse"  # marks a line the shell could not parse
 ROUNDS = 5  # the model sees its commands' output and may continue
 SKILL = HERE.parent / "skills" / "steward"
-VERSIONS = {
-    "v01": {"script": HERE / "v01" / "space.py", "steward": HERE / "v01" / "SKILL.md",
-            "orchestrator": HERE / "v01" / "orchestrator-prompt.md"},
-    "v02": {"script": SKILL / "scripts" / "space.py", "steward": SKILL / "SKILL.md",
-            "orchestrator": SKILL / "orchestrator-prompt.md"},
-}  # fmt: skip
+SCRIPT = SKILL / "scripts" / "space.py"
+PROMPTS = {
+    "steward": SKILL / "SKILL.md",
+    "orchestrator": SKILL / "orchestrator-prompt.md",
+}
 INTERFACE = """
 
 ---
@@ -52,9 +48,11 @@ When nothing more is needed, reply with an empty block.
 """
 
 
-def space(script: Path, root: Path, argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(script), "--dir", str(root), *argv],
-                          capture_output=True, text=True, cwd=cwd, timeout=60)  # fmt: skip
+def space(root: Path, argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--dir", str(root), *argv],
+        capture_output=True, text=True, cwd=cwd, timeout=60,
+    )
 
 
 def rows(path: Path) -> list[dict]:
@@ -80,14 +78,14 @@ def commands(reply: str) -> list[list[str]]:
     return out
 
 
-def execute(script: Path, root: Path, cmds: list[list[str]], last: str = "") -> list[dict]:
+def execute(root: Path, cmds: list[list[str]], last: str = "") -> list[dict]:
     log = []
     for argv in cmds:
         if argv[0] == PARSE:
             log.append({"argv": ["(unparsed)"], "code": 2, "out": "", "err": argv[1], "last": last})
             continue
         argv = [a.replace("$ID", last) for a in argv]
-        proc = space(script, root, argv, root.parent)
+        proc = space(root, argv, root.parent)
         if argv[0] in {"add", "task"} and proc.returncode == 0:
             last = proc.stdout.strip()
         log.append({"argv": argv, "code": proc.returncode, "out": proc.stdout.strip()[:600],
@@ -154,7 +152,7 @@ def check(root: Path, before: dict, expect: dict) -> list[str]:
             if mid[0].lower() == box[0] and state.get(mid):
                 miss.append(f"{mid} acked")
     if "gate" in expect:
-        code = space(VERSIONS["v02"]["script"], root, ["gate"], root.parent).returncode
+        code = space(root, ["gate"], root.parent).returncode
         if code != expect["gate"]:
             miss.append(f"gate {code}, not {expect['gate']}")
     return miss
@@ -163,19 +161,18 @@ def check(root: Path, before: dict, expect: dict) -> list[str]:
 def build(scn: dict, tmp: Path) -> tuple[Path, dict, str]:
     """Create the scenario's brainspace with the current script; return it, counts and a state dump."""
     root = tmp / ".steward"
-    new = VERSIONS["v02"]["script"]
-    space(new, root, ["init", scn.get("goal", "Ship the project.")], tmp)
+    space(root, ["init", scn.get("goal", "Ship the project.")], tmp)
     for rel, text in scn.get("files", {}).items():
         path = tmp / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     for line in scn.get("setup", []):
-        proc = space(new, root, shlex.split(line), tmp)
+        proc = space(root, shlex.split(line), tmp)
         if proc.returncode not in (0, 2, 3):
             raise RuntimeError(f"{scn['id']} setup failed: {line}: {proc.stderr}")
     before = {b: len(rows(root / f"{b.upper()}.jsonl")) for b in ("inbox", "outbox")}
     dump = f"$ cat GOAL.md\n{(root / 'GOAL.md').read_text().strip()}\n" + "\n".join(
-        f"$ space.py {' '.join(a)}\n{space(new, root, a, tmp).stdout.strip() or '(nothing)'}"
+        f"$ space.py {' '.join(a)}\n{space(root, a, tmp).stdout.strip() or '(nothing)'}"
         for a in (["list"], ["read", "inbox"], ["read", "outbox"])
     )
     return root, before, dump
@@ -213,11 +210,10 @@ def call(model: str, system: str, user: str) -> tuple[str, float]:
     return out.get("result", ""), out.get("total_cost_usd", 0.0)
 
 
-def trial(scn: dict, version: str, model: str) -> dict:
-    v = VERSIONS[version]
+def trial(scn: dict, model: str) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         root, before, dump = build(scn, Path(tmp))
-        system = v[scn["role"]].read_text() + INTERFACE
+        system = PROMPTS[scn["role"]].read_text() + INTERFACE
         user = f"Brainspace state:\n{dump}\n\nEvent ({scn['role']}):\n{scn['event']}"
         log, replies, cost, last = [], [], 0.0, ""
         for _ in range(ROUNDS):
@@ -227,11 +223,11 @@ def trial(scn: dict, version: str, model: str) -> dict:
                 except (subprocess.TimeoutExpired, RuntimeError):  # one retry: a hung API call is not the model's fault
                     reply, spent = call(model, system, user)
             except Exception as err:  # noqa: BLE001 - a failed call is a failed trial, not a crash
-                return {"id": scn["id"], "version": version, "role": scn["role"], "pass": False,
+                return {"id": scn["id"], "role": scn["role"], "pass": False,
                         "miss": [f"call: {err}"], "cost": cost}  # fmt: skip
             replies.append(reply)
             cost += spent
-            step = execute(v["script"], root, commands(reply), last)
+            step = execute(root, commands(reply), last)
             if not step:
                 break
             log += step
@@ -241,25 +237,23 @@ def trial(scn: dict, version: str, model: str) -> dict:
             user += f"\n\nYou ran:\n{shown}\n\nMore commands, or an empty block if you are finished."
         reply = "\n---\n".join(replies)
         miss = check(root, before, scn["expect"])
-    return {"id": scn["id"], "version": version, "role": scn["role"], "pass": not miss, "miss": miss,
+    return {"id": scn["id"], "role": scn["role"], "pass": not miss, "miss": miss,
             "refused": sum(1 for c in log if c["code"] == 1), "log": log, "reply": reply, "cost": cost}  # fmt: skip
 
 
 def selfcheck(scenarios: list[dict]) -> int:
     bad = 0
     for scn in scenarios:
-        for version, key in (("v02", "solution"), ("v01", "solution_v01"), (None, None)):
-            if version == "v01" and "solution_v01" not in scn:  # uses verbs v01 does not have
-                continue
+        for run_solution in (True, False):
             with tempfile.TemporaryDirectory() as tmp:
                 root, before, _ = build(scn, Path(tmp))
-                if version:
-                    execute(VERSIONS[version]["script"], root, [shlex.split(c) for c in scn[key]])
+                if run_solution:
+                    execute(root, [shlex.split(c) for c in scn["solution"]])
                 miss = check(root, before, scn["expect"])
-            if version and miss:
+            if run_solution and miss:
                 bad += 1
-                print(f"{scn['id']}: {key} does not pass: {miss}")
-            if not version and not miss and not scn.get("passive"):
+                print(f"{scn['id']}: solution does not pass: {miss}")
+            if not run_solution and not miss and not scn.get("passive"):
                 bad += 1
                 print(f"{scn['id']}: passes with no commands; it tests nothing")
     print(f"{len(scenarios)} scenarios, {bad} problems")
@@ -273,42 +267,39 @@ def main() -> int:
     ap.add_argument("--model", default="claude-haiku-5-5")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--versions", nargs="+", default=["v01", "v02"], choices=list(VERSIONS))
     ap.add_argument("--out", default=str(HERE / "results"))
     args = ap.parse_args()
     scenarios = rows(Path(args.scenarios))
     if args.selfcheck:
         return selfcheck(scenarios)
 
-    for v in args.versions:
-        for role in ("steward", "orchestrator"):
-            agent(VERSIONS[v][role].read_text() + INTERFACE)
-    jobs = [(s, v) for s in scenarios for v in args.versions for _ in range(args.repeats)]
+    for role in ("steward", "orchestrator"):
+        agent(PROMPTS[role].read_text() + INTERFACE)
+    jobs = [s for s in scenarios for _ in range(args.repeats)]
     out = Path(args.out)
     out.mkdir(exist_ok=True)
     path = out / f"{re.sub(r'[/:#]', '_', args.model)}.jsonl"
     path.write_text("")
     results = []
     with cf.ThreadPoolExecutor(args.workers) as pool, path.open("a") as fh:
-        futures = [pool.submit(trial, s, v, args.model) for s, v in jobs]
+        futures = [pool.submit(trial, s, args.model) for s in jobs]
         for n, fut in enumerate(cf.as_completed(futures), 1):  # stream, so a slow run shows progress
             r = fut.result()
             results.append(r)
             fh.write(json.dumps(r) + "\n")
             fh.flush()
-            print(f"[{n}/{len(jobs)}] {r['version']} {r['id']}: {'pass' if r['pass'] else 'FAIL ' + '; '.join(r['miss'])[:160]}",
+            print(f"[{n}/{len(jobs)}] {r['id']}: {'pass' if r['pass'] else 'FAIL ' + '; '.join(r['miss'])[:160]}",
                   flush=True)  # fmt: skip
 
     tally: dict = defaultdict(lambda: [0, 0])
     for r in results:
-        for key in ((r["version"], "all"), (r["version"], r.get("role", "?")), (r["version"], r["id"])):
+        for key in ("all", r.get("role", "?"), r["id"]):
             tally[key][0] += r["pass"]
             tally[key][1] += 1
-    for v in args.versions:
-        parts = ", ".join(f"{k} {tally[v, k][0]}/{tally[v, k][1]}" for k in ("all", "steward", "orchestrator"))
-        print(f"{v}: {parts}")
+    parts = ", ".join(f"{k} {tally[k][0]}/{tally[k][1]}" for k in ("all", "steward", "orchestrator"))
+    print(parts)
     for s in scenarios:
-        print(f"  {s['id']:<28}" + "  ".join(f"{v} {tally[v, s['id']][0]}/{tally[v, s['id']][1]}" for v in args.versions))
+        print(f"  {s['id']:<28} {tally[s['id']][0]}/{tally[s['id']][1]}")
     print(f"cost ${sum(r['cost'] for r in results):.2f} for {len(results)} calls")
     return 0
 
