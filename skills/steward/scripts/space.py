@@ -876,10 +876,11 @@ def behaviour(root: Path) -> str:
     workers = sorted(p.name for p in (root / "agents").glob("*") if (p / "SESSION").exists())
     briefs = sorted(p.name for p in (root / "agents").glob("*") if (p / "BRIEF.md").exists())
     refused = [x for x in trace if x["code"] == 1]
+    item_summary = ", ".join(f"{r['id']} {r['state']}" for r in rows) or "none"
     lines = [
         f"orchestrator launched: {'yes' if (root / 'SESSION').exists() else 'NO'}",
         f"workers briefed: {len(briefs)} {briefs}; with a recorded session: {len(workers)} {workers}",
-        f"items: {len(rows)} ({', '.join(f'{r['id']} {r['state']}' for r in rows) or 'none'}); "
+        f"items: {len(rows)} ({item_summary}); "
         f"split: {sum(1 for r in rows if r['state'] == 'split' or r.get('part_of'))}",
         f"escalations: {used.get('escalate', 0)}; open requirements: {len(open_reqs(root))}; "
         f"worker questions (ask): {used.get('ask', 0)}; tell: {used.get('tell', 0)}",
